@@ -1,0 +1,812 @@
+---
+title: '10. Updates and recovery'
+description: How an update reaches the box, what the Linux step and the control surface step each do, what can brick it, and which recovery doors the source code leaves open.
+---
+
+import { Image } from 'astro:assets';
+import { Aside } from '@astrojs/starlight/components';
+import CodeRef from '../../../components/CodeRef.astro';
+import Quiz from '../../../components/Quiz.astro';
+import hero from '../../../assets/heroes/m10-updates.png';
+
+<Image src={hero} alt="A small dark device sits on a workbench with a glowing amber cable plugged in, and a recovery tool rests beside it." />
+
+**Module 10 of 12 &#183; about 40 minutes &#183; needs Modules 2, 3 and 5**
+
+An update is the one moment when the box rewrites its own brain while it is running on it. Most of the time it works. When it does not, you need to know which layer you broke and which door is still open.
+
+By the end you will be able to trace an update from a USB stick to a reboot, explain the two separate steps inside it (Linux, then the control surface chip), say honestly whether the box can fall back to an old copy, name what can brick it, list the recovery doors the source leaves open, and say why `CONFIG_BOOTDELAY=0` makes those doors matter more.
+
+<Aside type="note" title="Analogy">
+Think of swapping the engine in a car while the car is parked in your driveway, with the engine you are removing still running the garage lights. A safe shop keeps a second engine on a stand (a spare copy) and a tow truck on speed dial (a recovery path). A risky shop has neither. This lesson checks which kind of shop the KICK source describes.
+</Aside>
+
+## How an update reaches the box
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>Pick a source</b><span class="layer layer-userspace">user space</span><br />Settings opens the firmware screen. It lists USB, SD card or PC.</div>
+    <div class="kd-step"><b>Unwrap and mount</b><span class="layer layer-userspace">user space</span><br />The app unwraps the update file and mounts it under /tmp.</div>
+    <div class="kd-step"><b>Linux step</b><span class="layer layer-storage">storage</span><br />The app runs swupdate on the package. Progress comes back over a socket.</div>
+    <div class="kd-step"><b>Control surface step</b><span class="layer layer-hardware">hardware</span><br />A HEX file streams to the control surface chip, one record at a time.</div>
+    <div class="kd-step"><b>Reboot</b><span class="layer layer-kernel">kernel</span><br />The user taps yes and the box force-reboots.</div>
+  </div>
+  <figcaption>Five stages. Stages 3 and 4 are separate programs on separate chips, so one can succeed while the other fails.</figcaption>
+</figure>
+
+### Where the update file comes from
+
+The app knows three sources. Two are folders where a drive is mounted, and one is a folder used by a PC companion app:
+
+<CodeRef path="Kick/modules/hardware/source/kick_Hwcommon.h" line={26} expect="/mnt/sdcard">
+
+```cpp
+#define SDCARD_PATH  "/mnt/sdcard"
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/hardware/source/kick_Hwcommon.h" line={27} expect="/mnt/flash">
+
+```cpp
+#define USBDISK_PATH "/mnt/flash"
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/hardware/source/kick_Hwcommon.h" line={28} expect="/home/Kick/Firmware_Update">
+
+```cpp
+#define PCMODE_PATH  "/home/Kick/Firmware_Update"
+```
+
+</CodeRef>
+
+`/mnt/flash` is where USB-A drives show up, as Module 1 noted. The user reaches the update screen from the Settings info page:
+
+<CodeRef path="Kick/modules/kick_ui_settings/source/kick_ui_settings_info.cpp" line={60} expect="Screen::SWUpdateView">
+
+```cpp
+fwUpdate.onClick = [&]() { signals::sigScreenOpen( kick_ui::Screen::SWUpdateView ); };
+```
+
+</CodeRef>
+
+A scan looks for files in the drive folder. By default it looks for the `.img` extension:
+
+<CodeRef path="Kick/modules/hardware/source/kick_Hwpref.h" line={143} expect={`imageFormat = ".img"`}>
+
+```cpp
+std::vector<std::pair<std::string, linuxFwInfo>> getSWUFileswithVersion( const std::string& folderPath, const std::string& imageFormat = ".img" );
+```
+
+</CodeRef>
+
+The scan only offers files that are newer than what is installed. A file with an equal or lower version is logged and dropped:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={823} expect="VersionComparisonResult::Less">
+
+```cpp
+if( comparisonResult == mt::VersionComparisonResult::Less )
+```
+
+</CodeRef>
+
+So the screen gives you no downgrade button. If a new version breaks something, rolling back through this UI is not an option. That matters for the recovery section below.
+
+### Unwrap, then mount
+
+When the user confirms, the view checks the image before it opens the progress screen:
+
+<CodeRef path="Kick/modules/kick_ui/swupdate/kick_SWUpdateView.cpp" line={124} expect="validateImage()">
+
+```cpp
+mt::SwUpdateErrorCode_t error = mt::FirmwareUpdate::getSwupdateInstance().validateImage();
+```
+
+</CodeRef>
+
+`validateImage` does two jobs. It unwraps the update file, then it extracts what is inside:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={579} expect="decryptopenSSLImage( fwpath )">
+
+```cpp
+if( mt::HwPref::getHwPref().decryptopenSSLImage( fwpath ) )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={581} expect="extractImage()">
+
+```cpp
+if( mt::HwPref::getHwPref().extractImage() )
+```
+
+</CodeRef>
+
+The unwrapped file lands in a scratch folder, and the extraction folder is a second scratch folder. Both are under `/tmp`, which means RAM-backed storage on most Linux systems (general knowledge, and I did not check the mount on this image):
+
+<CodeRef path="Kick/modules/hardware/source/kick_Hwpref.h" line={181} expect={`"/tmp/image/"`}>
+
+```cpp
+std::string  decrptionDir    = "/tmp/image/";
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/hardware/source/kick_Hwpref.h" line={182} expect={`"/tmp/fwupdate"`}>
+
+```cpp
+std::string  extractDir      = "/tmp/fwupdate";
+```
+
+</CodeRef>
+
+The unwrapped file is a whole ext4 filesystem in one file. The app mounts it through a loop device, which is a way to mount a file as if it were a disk:
+
+<CodeRef path="Kick/modules/hardware/source/kick_Hwpref.cpp" line={224} expect="mount -o loop -t ext4">
+
+```cpp
+std::string cmd         = "mount -o loop -t ext4  " + outFullpath + " " + extractDir;
+```
+
+</CodeRef>
+
+Inside that mount the app expects up to two payloads. The Linux package is a `.swu` file:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={115} expect="/tmp/fwupdate/Kick.swu">
+
+```cpp
+if( juce::File( "/tmp/fwupdate/Kick.swu" ).exists() )
+```
+
+</CodeRef>
+
+And the control surface firmware is a HEX file in the same folder:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.h" line={97} expect="/tmp/fwupdate/Kick_MCU.hex">
+
+```cpp
+juce::String                mcuFilePath           = "/tmp/fwupdate/Kick_MCU.hex";
+```
+
+</CodeRef>
+
+Both paths sit under the same extraction folder, so I read it as one package carrying both payloads. The repository has no tool that builds such a package, so I cannot show you the recipe. I have not seen a real update file.
+
+One more detail before the flash starts. The helper that strips the header from the update file deletes the original file on the USB stick or SD card, and it does that before decryption has succeeded:
+
+<CodeRef path="Kick/modules/hardware/source/kick_Hwpref.cpp" line={477} expect="std::remove( fwfilepath.c_str() )">
+
+```cpp
+if ( std::remove( fwfilepath.c_str() ) != 0 )
+```
+
+</CodeRef>
+
+If the unwrap then fails, the only copy of that update file on that stick is gone. Keep a second copy somewhere else. I put this in the checklist later.
+
+### The Linux step: swupdate
+
+SWUpdate is an open-source update agent for embedded Linux. Buildroot builds it into the image:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={118} expect="BR2_PACKAGE_SWUPDATE=y">
+
+```text
+BR2_PACKAGE_SWUPDATE=y
+```
+
+</CodeRef>
+
+The app does not link against it. It starts the `swupdate` program as a command through the shell, and it tells it which package to install:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={440} expect="/tmp/fwupdate/Kick.swu -v &">
+
+```cpp
+std::string filePath = "/tmp/fwupdate/Kick.swu -v &";
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={441} expect="/usr/bin/swupdate">
+
+```cpp
+std::string command  = "/usr/bin/swupdate" + std::string( " -i " ) + filePath;
+```
+
+</CodeRef>
+
+The app then reads progress messages from a socket that swupdate creates:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.h" line={107} expect="/tmp/swupdateprog">
+
+```cpp
+const char* socketpath = "/tmp/swupdateprog";
+```
+
+</CodeRef>
+
+The progress screen runs all of this on a detached thread, so the UI stays alive while the flash happens:
+
+<CodeRef path="Kick/modules/kick_ui/swupdate/kick_SWUpdateScreen.cpp" line={74} expect="updateFirmware()">
+
+```cpp
+mt::FirmwareUpdate::getSwupdateInstance().updateFirmware();
+```
+
+</CodeRef>
+
+The screen itself tells the user the one thing they must not do:
+
+<CodeRef path="Kick/modules/kick_ui/swupdate/kick_SWUpdateScreen.h" line={40} expect="Do not power off the device.">
+
+```cpp
+ui::KickLabel           poweroffLabel{ "Do not power off the device." };
+```
+
+</CodeRef>
+
+Two failure modes in that wait loop are worth knowing. If the app cannot reach the socket and was told not to retry, it exits the whole program:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={61} expect="exit( 1 );">
+
+```cpp
+exit( 1 );
+```
+
+</CodeRef>
+
+And the loop that waits for the socket file to appear sleeps 100 seconds per pass, not 100 milliseconds:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={460} expect="sleep( 100 );">
+
+```cpp
+sleep( 100 );
+```
+
+</CodeRef>
+
+I read both as bugs or at least hazards. I have not triggered either.
+
+### Reboot
+
+When swupdate reports success, the screen asks if the user wants to reboot, and then it forces one:
+
+<CodeRef path="Kick/modules/kick_ui/swupdate/kick_SWUpdateScreen.cpp" line={125} expect={`reboot -nf`}>
+
+```cpp
+if( system( "reboot -nf" ) == 0 )
+```
+
+</CodeRef>
+
+From general Linux knowledge, `-f` forces the reboot without asking init to shut down cleanly, and `-n` skips flushing file buffers to disk. Right after a big write that is the wrong moment to skip a flush. I have not tested whether it loses data on this box.
+
+<Aside type="caution" title="Not verified on hardware">
+I traced all of this by reading source. I have not run an update on a real unit, and I have not seen a real update package. Every claim about what a package contains or writes is inference from the code that opens it.
+</Aside>
+
+## One copy or two?
+
+A box with an A/B layout keeps two root filesystems. The update writes to the idle one, flips a flag, and reboots. If the new copy fails to boot, the bootloader flips back. A single-copy box overwrites the only one it has.
+
+The evidence in the source points to a single copy. I will lay it out, then say what I cannot see.
+
+The eMMC partition table defines one root filesystem, then one more partition for `usr`:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/genimage.cfg.emmc.partiton.table" line={25} expect="partition rootfs {">
+
+```text
+partition rootfs {
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/genimage.cfg.emmc.partiton.table" line={32} expect="partition usr {">
+
+```text
+partition usr {
+```
+
+</CodeRef>
+
+The swupdate build has no bootloader integration, which is the hook a normal A/B setup uses to flip slots (general SWUpdate knowledge):
+
+<CodeRef path="Linux/buildroot/package/swupdate/swupdate.config" line={57} expect="CONFIG_BOOTLOADER_NONE=y">
+
+```text
+CONFIG_BOOTLOADER_NONE=y
+```
+
+</CodeRef>
+
+And the handler list includes the raw handler, which writes bytes straight to a device or partition:
+
+<CodeRef path="Linux/buildroot/package/swupdate/swupdate.config" line={108} expect="CONFIG_RAW=y">
+
+```text
+CONFIG_RAW=y
+```
+
+</CodeRef>
+
+What I cannot see is the `sw-description` file, the manifest inside a `.swu` that says which handler writes which bytes to which device. It is not in the repository. So I cannot say what a real update writes.
+
+U-Boot does keep two copies of its environment, which is not the same thing. That is the saved variables, not the OS:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/u-boot/imx8mm_var_dart_defconfig" line={64} expect="CONFIG_SYS_REDUNDAND_ENVIRONMENT=y">
+
+```text
+CONFIG_SYS_REDUNDAND_ENVIRONMENT=y
+```
+
+</CodeRef>
+
+My honest summary: the config shows one root filesystem and no slot-flip hook. Plan as if there is no fallback copy. If you learn otherwise from a real package, send a pull request.
+
+Module 2 left a puzzle open: the mount units point at partitions 6 to 8, and the table defines fewer. That mismatch matters here, because a layout you do not fully understand is a layout you can break with an update.
+
+## The control surface step
+
+After the Linux step succeeds, the app also updates the chip that runs the pads, knobs and LEDs. It does that only if the HEX file is present and the control surface has already reported a version:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={112} expect="getSurfaceVersion().isNotEmpty()">
+
+```cpp
+bool mcuFwStatus = ( isMCUImagePresent() && mt::HwPref::getHwPref().getSurfaceVersion().isNotEmpty() );
+```
+
+</CodeRef>
+
+Then it calls the MCU routine, which is a small state machine:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={129} expect="MCUUpdate( mcuFilePath )">
+
+```cpp
+int mcuUpdate = MCUUpdate( mcuFilePath );
+```
+
+</CodeRef>
+
+The update rides the same serial packet link Module 5 describes. The constructor builds every update message as a system packet with the software-update command:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={30} expect="EN_PKT_TYPE_SYSTEM">
+
+```cpp
+hwMessage.pktType = CPktMgr::enumPacketType::EN_PKT_TYPE_SYSTEM;
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={31} expect="EN_SYS_SW_UPDATE">
+
+```cpp
+hwMessage.pktCmd  = contracts::DeviceControlContracts::SysCmd::EN_SYS_SW_UPDATE;
+```
+
+</CodeRef>
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>INITIATE</b><span class="layer layer-userspace">app</span><br />The app tells the chip an update is starting.</div>
+    <div class="kd-step"><b>BEGIN</b><span class="layer layer-hardware">chip</span><br />The chip answers that it is ready.</div>
+    <div class="kd-step"><b>Read a record</b><span class="layer layer-userspace">app</span><br />The app reads the next line of the HEX file.</div>
+    <div class="kd-step"><b>DATA</b><span class="layer layer-message">packet link</span><br />The app sends that record in one packet.</div>
+    <div class="kd-step"><b>ACK, repeat</b><span class="layer layer-hardware">chip</span><br />The chip acknowledges. The loop continues until the file ends, then END.</div>
+  </div>
+  <figcaption>The chip sets the pace. The app only sends the next record after the chip answers.</figcaption>
+</figure>
+
+The first command is INITIATE, and it is enum value zero:
+
+<CodeRef path="Kick/modules/hardware/source/kick_Hwcommon.h" line={94} expect="EN_SW_UPDATE_INITIATE = 0">
+
+```cpp
+EN_SW_UPDATE_INITIATE = 0, // send to mcu when user initiates transfer
+```
+
+</CodeRef>
+
+The chip's reply decides what happens next. The handler maps the first data byte of the reply to a state. A 1 means begin, a 6 means failure, and anything else is an acknowledgment:
+
+<CodeRef path="Kick/modules/kick_ui/swupdate/kick_SWUpdateScreen.cpp" line={238} expect="f_hwMsg.data[0] == 1">
+
+```cpp
+if( f_hwMsg.data[0] == 1 )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui/swupdate/kick_SWUpdateScreen.cpp" line={245} expect="f_hwMsg.data[0] == 6">
+
+```cpp
+else if( f_hwMsg.data[0] == 6 )
+```
+
+</CodeRef>
+
+The file format is Intel HEX, a plain text format where each line is one record. From general knowledge, a record starts with a colon. The parser checks for it, and raises a debug assertion if it is missing:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={359} expect="if( tmp != ':' )">
+
+```cpp
+if( tmp != ':' )
+```
+
+</CodeRef>
+
+The progress bar estimates the number of records from the file size, using a fixed record length of 43 characters:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={154} expect="hexRecSize             = 43">
+
+```cpp
+static int         hexRecSize             = 43;
+```
+
+</CodeRef>
+
+Records of a different length make that bar drift. It is cosmetic, but it shows the code assumes one HEX layout. Each data record goes out as one packet:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={220} expect="createAndSendCommandToDcl( hwMessage )">
+
+```cpp
+contracts::DclSignals::createAndSendCommandToDcl( hwMessage );
+```
+
+</CodeRef>
+
+Now the risk. The loop runs while a flag is true, and an idle state does nothing:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={175} expect="while( boDataTransferPending )">
+
+```cpp
+while( boDataTransferPending )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={305} expect="case MCUUpdateAction::EN_SW_UPDATE_IDLE:">
+
+```cpp
+case MCUUpdateAction::EN_SW_UPDATE_IDLE:
+```
+
+</CodeRef>
+
+After sending a record the state goes idle and waits for the chip to answer. I see no timeout in this loop. If the chip never answers, the app waits. Whether the chip itself has a bootloader that survives a half-sent image is not visible to me, because the chip's firmware is not in this repository.
+
+There is also an ordering hazard. The Linux step runs first. If it succeeded and the chip step then fails, the box runs new Linux and an old, or half-written, control surface image. The code does not compare the two versions as a pair. One more oddity: when the Linux step fails, the code logs a success message and returns, which skips the chip step:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={122} expect={`Linux FwUpdate SuccessFul`}>
+
+```cpp
+DBG( " Linux FwUpdate SuccessFul" );
+```
+
+</CodeRef>
+
+That line sits inside `if( status != SUCCESS )`. I read it as a misleading log message in front of a correct early return, but I have not run it.
+
+## What can brick the box
+
+I use "brick" to mean the box no longer boots into the app and the UI cannot fix it. These are the paths I see in the source, ordered by how deep they go.
+
+| Failure | Layer | What I can say from the source |
+|---|---|---|
+| Bad or wrong update file | User space | Validation fails with a message. The stick copy may already be deleted. Usually harmless. |
+| Power loss during the Linux step | Storage | One root filesystem, no slot-flip hook. A half-written root is the likely result. Not verified on hardware. |
+| Bad package contents | Storage | The raw handler writes straight to a device. A manifest that names the wrong device is a brick. I cannot see a real manifest. |
+| Chip step fails or stalls | Hardware | No timeout in the loop. The chip may be left with a partial image. Not verified on hardware. |
+| Bad U-Boot variables or boot command | Bootloader | The saved variables live on the eMMC, and with no boot delay you cannot interrupt a bad boot by keypress. |
+| Overwrite of the boot area | Bootloader | The boot image sits in front of the first partition. Writing there with a wrong image removes the first stage the ROM looks for. |
+
+The U-Boot variable block has a config file for the Linux-side tool that edits it, with two copies:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/fw_env.config" line={12} expect="/dev/mmcblk2">
+
+```text
+/dev/mmcblk2		0x400000	0x20000
+```
+
+</CodeRef>
+
+The config file exists, but I found no target package for the editing tool in the defconfig, only the host build of U-Boot tools. So I do not know that `fw_setenv` is on the box. Check before you count on it.
+
+## Why BOOTDELAY=0 raises the stakes
+
+Module 2 showed that U-Boot waits zero seconds before booting:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/u-boot/imx8mm_var_dart_defconfig" line={31} expect="CONFIG_BOOTDELAY=0">
+
+```text
+CONFIG_BOOTDELAY=0
+```
+
+</CodeRef>
+
+On a normal dev board, a bad image is a small problem. You power on, press a key at the serial console, get a U-Boot prompt, and load a good image from there. With the delay at zero there is no window for the keypress. The bootloader runs the saved boot command and leaves.
+
+That means every recovery door that depends on the prompt is closed by default. What remains are doors that work before U-Boot runs, or that run from other media. The next section lists them.
+
+## The recovery doors
+
+I rank these by how much evidence the repository gives me. None has been tried on a real unit.
+
+### Door 1: boot from an SD card that reflashes the eMMC
+
+This is the strongest evidence. A patch to U-Boot adds a function that checks whether the board booted from the SD card:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/patches/u-boot/001-sd-boot-burn-emmc.patch" line={45} expect="BOOT_DEVICE_MMC1">
+
+```text
++	if(boot_device == BOOT_DEVICE_MMC1){	/* we boot from SD card */
+```
+
+</CodeRef>
+
+It does nothing unless an address variable is set. If it is not, the function returns without a word:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/patches/u-boot/001-sd-boot-burn-emmc.patch" line={56} expect="if(!addr_str) return;">
+
+```text
++		if(!addr_str) return;
+```
+
+</CodeRef>
+
+Then it reads the root filesystem image from the SD card's FAT partition, and writes it to the eMMC at an 8 MB offset:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/patches/u-boot/001-sd-boot-burn-emmc.patch" line={37} expect="ROOTFS_OFFSET (8 * 1024 * 1024)">
+
+```text
++#define ROOTFS_OFFSET (8 * 1024 * 1024)
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/patches/u-boot/001-sd-boot-burn-emmc.patch" line={71} expect="rootfs.ext4.gz">
+
+```text
++		if (fat_read_file("rootfs.ext4.gz", (unsigned char *)addr, 0, 0, &size) < 0){
+```
+
+</CodeRef>
+
+Last it writes a partition table image at offset zero:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/patches/u-boot/001-sd-boot-burn-emmc.patch" line={82} expect="gzwrite((unsigned char *)addr, size, emmc, 1<<20, 0, 0)">
+
+```text
++		if(gzwrite((unsigned char *)addr, size, emmc, 1<<20, 0, 0)){
+```
+
+</CodeRef>
+
+Things I take from this:
+
+- The root filesystem is written first and the partition table second, so a failure between them leaves a new root under an old table.
+- Errors end in a bare `return`. I see no log, so a silent skip looks the same as success from the outside.
+- Rewriting the partition table at offset zero can destroy your user data partition (my inference, not tested). Back up first.
+- I see no guard that makes the flash happen only once. If you leave the card in, I would expect it to run on every SD boot. Not verified.
+- This path does not check who made the image on the card. It needs physical access, and it is both a recovery tool and a thing to protect.
+
+The build makes the SD image for you. The image that carries those two files is defined here:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/genimage.cfg.sd" line={52} expect="image sdcard_write_emmc.img{">
+
+```text
+image sdcard_write_emmc.img{
+```
+
+</CodeRef>
+
+The post-image script compresses the root filesystem into the name the patch looks for:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/post-image.sh" line={140} expect="gzip -f -9 ${BINARIES_DIR}/rootfs.ext4">
+
+```sh
+gzip -f -9 ${BINARIES_DIR}/rootfs.ext4
+```
+
+</CodeRef>
+
+Whether the chip will boot from the SD slot depends on boot-mode pins or fuses on the carrier board. The repository does not say how the KICK sets them. If the box ignores the SD slot at power-on, this door is shut. Not verified on hardware.
+
+### Door 2: USB serial download mode and UUU
+
+i.MX chips have a boot ROM mode that accepts an image over USB instead of reading storage. NXP's UUU tool drives it from a PC. That is general NXP knowledge. The repository does not contain a UUU script or any README text about it, and the Buildroot tree only carries an old tool of the same family as a host package that the KICK config does not enable.
+
+What the U-Boot config does show is that the first-stage loader supports the USB download protocol:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/u-boot/imx8mm_var_dart_defconfig" line={42} expect="CONFIG_SPL_USB_SDP_SUPPORT=y">
+
+```text
+CONFIG_SPL_USB_SDP_SUPPORT=y
+```
+
+</CodeRef>
+
+Because this mode runs before U-Boot, `BOOTDELAY=0` does not block it. Two unknowns decide whether it works on a KICK: whether the enclosure exposes a way to pick that boot mode, and whether a USB port reaches the chip for it. Neither is in the source. Not verified on hardware.
+
+### Door 3: fastboot from U-Boot
+
+U-Boot is built with fastboot support, and with the option that lets fastboot write to flash:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/u-boot/imx8mm_var_dart_defconfig" line={73} expect="CONFIG_USB_FUNCTION_FASTBOOT=y">
+
+```text
+CONFIG_USB_FUNCTION_FASTBOOT=y
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/u-boot/imx8mm_var_dart_defconfig" line={76} expect="CONFIG_FASTBOOT_FLASH=y">
+
+```text
+CONFIG_FASTBOOT_FLASH=y
+```
+
+</CodeRef>
+
+But you start fastboot from the U-Boot prompt, and the zero delay hides that prompt. So this door is open only if you can reach U-Boot another way, for example by booting a U-Boot that shows a prompt from SD. Not verified on hardware.
+
+### Door 4: the serial console and, on a dev build, SSH
+
+The image runs a login on a serial port:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={6} expect={`BR2_TARGET_GENERIC_GETTY_PORT="ttymxc3"`}>
+
+```text
+BR2_TARGET_GENERIC_GETTY_PORT="ttymxc3"
+```
+
+</CodeRef>
+
+That helps only if the OS boots far enough to start the login. It does not help with a bad bootloader. Where the serial pins are on the board is not documented in the repository.
+
+The vendor README describes the image as a development build with a root account that has no password and an SSH server on:
+
+<CodeRef path="Linux/README.md" line={18} expect="no password">
+
+```text
+The image is a development build: the root account has **no password** and the Dropbear SSH server is
+```
+
+</CodeRef>
+
+On a dev build that gives you a way in from the network if the OS still boots. It is also a security hole, and the README says not to put it on a network as-is. Use it, then close it.
+
+## A safe-practice checklist
+
+This is general engineering advice, built on what the source shows. Nothing here has been tried on a real box.
+
+1. **Prove your recovery first.** Before you flash anything of your own, boot a stock image from SD and confirm the box takes the SD slot. If that does not work, stop. You have no tow truck.
+2. **Dump the eMMC before experiments.** Store the image off the device. A full copy turns most disasters into an afternoon.
+3. **Test on removable media.** The build produces an SD image that boots Linux without touching the eMMC. Run new kernels, device trees and root filesystems from that card first:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/genimage.cfg.sd" line={73} expect="image sdcard_linux.img {">
+
+```text
+image sdcard_linux.img {
+```
+
+</CodeRef>
+
+4. **Keep the update file somewhere else.** The box deletes the original on the stick before it knows the unwrap worked.
+5. **Do not leave the flashing card in.** Assume it reflashes every time you boot from it.
+6. **Leave the boot area alone** until steps 1 to 3 pass. Do not touch the first-stage loader or the U-Boot variables on a box you cannot recover.
+7. **Keep the control surface HEX out of your first experiments.** Do the Linux step alone. Restart the app between attempts, because the HEX routine keeps its position in static variables.
+8. **Use steady power.** The screen says not to power off for a reason.
+9. **Know your serial console** before you need it.
+
+## How a custom OS should handle updates
+
+These are design pointers, not working code. I claim nothing here has been built or tested for the KICK.
+
+- **Keep two copies of the root filesystem** and a way to flip between them. Let the bootloader count boot attempts and fall back by itself when the new copy fails.
+- **Sign updates with an asymmetric key.** The device holds only the public half. The private half stays off every device and off the build machine you use daily. A signature proves who made the file; hiding the contents does not.
+- **Verify before you write.** Check the signature and a hash of the whole package, then write. Do not delete the source until the new system has booted.
+- **Write the control surface chip safely.** Put a small loader in the chip that cannot be overwritten, check each record, check a hash of the whole image at the end, add timeouts to the handshake, and refuse to run mismatched Linux and chip versions as a pair.
+- **Keep a recovery entry that works with no delay.** A held button, a GPIO, or a short boot delay gives you a way in. Authenticate whatever that path loads.
+- **Avoid shell strings.** Passing file paths and secrets through a shell command is fragile and leaks values to anything that can list processes. Call libraries directly or pass arguments as an array.
+- **Plan downgrades on purpose.** The stock screen only offers newer files. Decide if your OS allows going back, and what it does to saved data.
+- **Close the dev doors** (open SSH, empty root password) in anything you ship.
+
+## Try it yourself
+
+This lab is read-only. You change nothing. Check out the upstream clone at the pinned commit and take a grep tour of the update flow:
+
+```bash
+cd Kick/modules
+grep -n "USBDISK_PATH\|SDCARD_PATH\|PCMODE_PATH" hardware/source/kick_Hwcommon.h
+grep -n "validateImage\|linuxUpdate\|MCUUpdate\|updateFirmware" hardware/source/kick_FirmwareUpdate.cpp | head -30
+grep -n "reboot" kick_ui/swupdate/kick_SWUpdateScreen.cpp
+cd ../../Linux/buildroot
+grep -n "BOOTLOADER\|RAW" package/swupdate/swupdate.config
+grep -n "partition " board/freescale/imx8mm_var_som/genimage.cfg.emmc.partiton.table
+grep -n "BOOTDELAY\|FASTBOOT\|SDP" board/freescale/imx8mm_var_som/u-boot/imx8mm_var_dart_defconfig
+```
+
+Then write one page that answers three questions. Which line decides that the chip step runs after the Linux step? Which line would you change first to make the SD flash path log its errors? And if you lost the serial pins, which recovery door would you try first and why?
+
+## Check yourself
+
+<Quiz
+  items={[
+    {
+      q: 'Where do USB-A drives appear for the update scan?',
+      options: [
+        '/mnt/flash',
+        '/tmp/fwupdate',
+        '/home/Kick/Firmware_Update',
+        '/dev/mmcblk2',
+      ],
+      answer: 0,
+      why: 'USBDISK_PATH is /mnt/flash. The other paths are the PC companion folder, the extraction folder and the eMMC device.',
+    },
+    {
+      q: 'Why does the source suggest the KICK has no fallback copy of the OS?',
+      options: [
+        'The app refuses to run a second update',
+        'The partition table defines one root filesystem and swupdate is built with no bootloader hook',
+        'The eMMC is too small for two copies',
+        'U-Boot always overwrites the old copy on reboot',
+      ],
+      answer: 1,
+      why: 'One rootfs partition and CONFIG_BOOTLOADER_NONE are the evidence. The manifest inside a real package is not in the repository, so this stays an inference.',
+    },
+    {
+      q: 'What does the control surface update do after sending each HEX record?',
+      options: [
+        'Sends the next record right away',
+        'Reboots the chip',
+        'Goes idle and waits for the chip to answer',
+        'Writes the record to eMMC',
+      ],
+      answer: 2,
+      why: 'The state goes idle after each send. The chip answers with an acknowledgment, and I see no timeout in the loop.',
+    },
+    {
+      q: 'Why does CONFIG_BOOTDELAY=0 raise the stakes of a bad image?',
+      options: [
+        'It makes the kernel slower to start',
+        'It deletes the old image',
+        'It removes the keypress window that opens a U-Boot prompt for recovery',
+        'It disables the SD slot',
+      ],
+      answer: 2,
+      why: 'With no delay you cannot interrupt the boot to reach the prompt. Recovery has to come from media or a USB download mode instead.',
+    },
+    {
+      q: 'What does the stock update code do to the update file on the USB stick?',
+      options: [
+        'Leaves it alone',
+        'Deletes it before decryption is known to have succeeded',
+        'Moves it to /tmp/fwupdate',
+        'Renames it to Kick.swu',
+      ],
+      answer: 1,
+      why: 'The header-stripping helper removes the original file, so keep a second copy somewhere else.',
+    },
+  ]}
+/>
+
+## Words to know
+
+| Term | Meaning |
+|---|---|
+| swupdate | An open-source update agent for embedded Linux. It installs a package, called a .swu file |
+| .swu | A package that holds a manifest plus the payloads to write |
+| sw-description | The manifest inside a .swu. It says which handler writes which payload to which device |
+| Raw handler | A swupdate handler that writes bytes directly to a device or partition |
+| A/B layout | Two copies of the OS. Update the idle one, then flip. Roll back if it fails |
+| Brick | A device that no longer boots and cannot be fixed from its own UI |
+| Loop mount | Mounting a file as if it were a disk |
+| Intel HEX | A text format for firmware. One record per line, each starting with a colon |
+| MCU | Microcontroller. Here, the control surface chip |
+| Serial download mode | A chip boot mode that takes an image over USB instead of reading storage |
+| UUU | NXP's PC tool for serial download mode. General knowledge, not in this repository |
+| Fastboot | A protocol for flashing a device from a PC, available from the U-Boot prompt |
+| Authenticity | Proof of who made a file. A different goal from hiding its contents |
+
+Next: [Module 11, The camera](/kick-firmware-course/course/11-camera/).

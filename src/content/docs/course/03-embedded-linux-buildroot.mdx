@@ -314,7 +314,7 @@ The U-Boot patch is bigger. It adds a new C file to the board directory, and tha
 
 </CodeRef>
 
-So an SD card carrying `rootfs.ext4.gz` can install the OS onto the internal storage. The full flashing story belongs in the updates and recovery module, coming later. The installer also rewrites the partition table after it writes the rootfs, so I would not run it on a unit that holds data you care about (not verified on hardware). For now, note that this is board-specific code living in a patch, not in a package.
+So an SD card carrying `rootfs.ext4.gz` can install the OS onto the internal storage. The full flashing story belongs in [Module 10](/kick-firmware-course/course/10-updates-and-recovery/). The installer also rewrites the partition table after it writes the rootfs, so I would not run it on a unit that holds data you care about (not verified on hardware). For now, note that this is board-specific code living in a patch, not in a package.
 
 ### The rootfs overlay
 

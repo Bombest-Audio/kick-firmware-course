@@ -38,6 +38,7 @@ export default defineConfig({
 				{ label: '7. Sound engine II', slug: 'course/07-sound-engine-2' },
 				{ label: '8. Time', slug: 'course/08-time' },
 				{ label: '9. State', slug: 'course/09-state' },
+				{ label: '10. Updates and recovery', slug: 'course/10-updates-and-recovery' },
 				{ label: '11. The camera', slug: 'course/11-camera' },
 				{ label: '12. Fork it', slug: 'course/12-fork-it' },
 				{ label: 'Diagram kit', slug: 'contribute/diagram-kit' },
