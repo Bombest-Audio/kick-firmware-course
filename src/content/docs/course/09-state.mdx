@@ -1,0 +1,1312 @@
+---
+title: '9. State: projects, ValueTree and undo'
+description: Where a KICK project lives while it plays and while it sleeps. One JUCE ValueTree that the screens, the engine and the disk all read, how undo works, how values reach the audio side, and what the code does when it saves.
+---
+
+import { Image } from 'astro:assets';
+import { Aside } from '@astrojs/starlight/components';
+import CodeRef from '../../../components/CodeRef.astro';
+import Quiz from '../../../components/Quiz.astro';
+import hero from '../../../assets/heroes/m09-state.png';
+
+<Image src={hero} alt="A stack of translucent snapshot cards fans out behind the top card like an undo history, the top card glowing pink." />
+
+**Module 9 of 12 &#183; about 45 minutes &#183; needs Module 4**
+
+You change a note's probability from 100 to 50. Three things must now agree. The screen must show 50. The sequencer must roll the dice against 50. The file on the flash must say 50 tomorrow. If each of them keeps its own copy of the number, they drift apart, and the bugs that follow are the hardest kind: the unit looks fine and sounds wrong.
+
+The KICK avoids this with one tree of values that all three read. This lesson opens that tree. You will see its real shape, how edits become undo steps, how a value gets from a screen to the audio side, and what the code does when it saves.
+
+By the end you will be able to follow one property from a widget, into the tree, into the sequencer and onto disk, naming each file and each thread on the way. You will also know which claims about a power cut the code supports and which it does not.
+
+<Aside type="note" title="Analogy">
+A whiteboard in a rehearsal room. Everyone in the band reads the same board, and nobody keeps a private setlist in their head. When one person changes a line, the others see it change. Every few seconds someone photographs the board. Undo is a stack of those snapshots: take the top one off and the board goes back. The stack is a simplification. The real undo list stores the reverse of each edit, not a full copy of the board. The photo part is close to true, though: the project file is the board written out as text.
+</Aside>
+
+## Why state needs one model
+
+Three parts of the program care about the project at once.
+
+- **The screens** draw it. A list view shows note rows. A knob shows a level.
+- **The engine** plays it. The sequencer walks the notes and asks each one whether it should sound.
+- **The disk** keeps it. A project must come back after a restart.
+
+There are two ways to wire that up. In the first, each part keeps its own data and copies changes to the others. That is a lot of copy code, and every missed copy is a bug. In the second, there is one place where the data lives. Everyone reads it there, and every edit goes through it. Programmers call that place the **single source of truth**. The KICK takes the second route.
+
+The price is that the one place must be safe to touch from several threads, and it is not, by itself. A large part of this lesson is about that gap.
+
+## ValueTree in plain terms
+
+JUCE ships a data structure called a **ValueTree**. Think of one XML element. It has a type name, any number of named properties, and any number of children, which are ValueTrees too. A property holds a simple value such as a number, a string or a flag. That is the whole model (general JUCE knowledge).
+
+Two more facts matter.
+
+- **A ValueTree variable is a handle.** Copying the variable does not copy the data. Both variables point at the same node. So the engine, a screen and the file saver can each hold a handle and all see the same edit (general JUCE knowledge).
+- **Listeners.** Code can register to be told when a property changes, or a child is added, removed or reordered. The call happens right away, on the thread that made the change (general JUCE knowledge).
+
+Names for node types and properties are `juce::Identifier` objects. The KICK declares them all in one header with a macro, so a typo becomes a compile error instead of a silent new property:
+
+<CodeRef path="Kick/modules/engine/interface/source/mt_audio_ids.h" line={28} expect="#define DECLARE_ID( name )">
+
+```cpp
+#define DECLARE_ID( name ) const juce::Identifier name( #name );
+```
+
+</CodeRef>
+
+The root of every project tree is named `ROOT`:
+
+<CodeRef path="Kick/modules/engine/interface/source/mt_audio_ids.h" line={30} expect="DECLARE_ID( ROOT )">
+
+```cpp
+DECLARE_ID( ROOT )
+```
+
+</CodeRef>
+
+The audio manager, the object that owns the engine, holds the live project tree and the undo manager side by side:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.h" line={111} expect="vTree{ IDs::ROOT }">
+
+```cpp
+juce::ValueTree   vTree{ IDs::ROOT };
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.h" line={114} expect="juce::UndoManager undoManager;">
+
+```cpp
+juce::UndoManager undoManager;
+```
+
+</CodeRef>
+
+The upstream convention notes say the same: the project model is one ValueTree plus one UndoManager. That is a pattern the codebase follows, not a rule the compiler enforces.
+
+## The real shape of a project
+
+When you open a project, the manager builds the tree in a fixed order. Each line asks the tree for a child with a given name, creating it if it is missing, and hands that child to a sub-manager together with the undo manager. Here are the six children, in the order they are set up:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={166} expect="IDs::BUSES">
+
+```cpp
+busMgr.setup( vTree.getOrCreateChildWithName( IDs::BUSES, nullptr ), &undoManager );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={172} expect="IDs::FILEMANAGER">
+
+```cpp
+MTAudioAssetManager::setup( vTree.getOrCreateChildWithName( IDs::FILEMANAGER, nullptr ), &undoManager, projectManager::getProjectDir() );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={175} expect="IDs::TEMPOS">
+
+```cpp
+MTTempoMgr::setup( vTree.getOrCreateChildWithName( IDs::TEMPOS, nullptr ), &undoManager );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={181} expect="IDs::PROGRAMS">
+
+```cpp
+MTAudioProgramManager::setup( vTree.getOrCreateChildWithName( IDs::PROGRAMS, nullptr ), &undoManager );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={187} expect="IDs::SONGS">
+
+```cpp
+MTSongManager::init( vTree.getOrCreateChildWithName( IDs::SONGS, nullptr ), &undoManager );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={190} expect="IDs::SEQUENCES">
+
+```cpp
+MTAudioSequenceManager::setup( vTree.getOrCreateChildWithName( IDs::SEQUENCES, nullptr ), &undoManager );
+```
+
+</CodeRef>
+
+The recorder also gets the whole tree in the same function, so it may add its own nodes. I did not trace what it adds.
+
+Inside `SEQUENCES`, each sequence is a `SEQUENCE` node. A track is created by appending a `TRACK` child to its sequence's node, with the undo manager passed in:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_sequence.cpp" line={259} expect="vTree.appendChild( vt, undoManager );">
+
+```cpp
+vTree.appendChild( vt, undoManager );
+```
+
+</CodeRef>
+
+A track's notes live in a `NOTELIST` child of the track:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_note.cpp" line={70} expect="IDs::NOTELIST">
+
+```cpp
+vTree = parent.getOrCreateChildWithName( IDs::NOTELIST, um );
+```
+
+</CodeRef>
+
+And each note is a `NOTE` node with these properties. Look at how the typed view of a note binds to them:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_interface_types.cpp" line={545} expect="IDs::no">
+
+```cpp
+number.referTo( state, IDs::no, um, MIDI::NOTE_DEFAULT );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_interface_types.cpp" line={548} expect="IDs::start">
+
+```cpp
+start.referTo( state, IDs::start, um, 0 );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_interface_types.cpp" line={550} expect="IDs::probability">
+
+```cpp
+probability.referTo( state, IDs::probability, um, PROBABILITY::DEFAULT );
+```
+
+</CodeRef>
+
+The note number is stored under the name `no`, and the start under `start`. The same function also binds `id`, `mute`, `velocity`, `length` and `ratchet`. Put together, a project looks like this. I built this picture from the lines above, so it is a summary and not a file:
+
+<figure class="kd">
+  <div class="kd-grid">
+    <div class="kd-node layer-storage"><b>ROOT</b>name, manufacturer, version</div>
+    <div class="kd-node layer-storage"><b>BUSES</b>routing</div>
+    <div class="kd-node layer-storage"><b>FILEMANAGER</b>ASSETS, AUDIO, EXPORTS</div>
+    <div class="kd-node layer-storage"><b>TEMPOS</b>TEMPO children</div>
+    <div class="kd-node layer-storage"><b>PROGRAMS</b>PROGRAM children</div>
+    <div class="kd-node layer-storage"><b>SONGS</b>song steps</div>
+    <div class="kd-node layer-storage"><b>SEQUENCES</b>SEQUENCE, then TRACK, then NOTELIST, then NOTE</div>
+    <div class="kd-node layer-storage"><b>Project</b>version 1.0.0</div>
+  </div>
+  <figcaption>The children of ROOT after a project loads. The Project node is added by the project manager, covered under saving and loading below.</figcaption>
+</figure>
+
+### A project file starts nearly empty
+
+Open one of the demo projects shipped in the repository and you will see how little a fresh file holds:
+
+<CodeRef path="Kick/demos/Demo 01/Demo 01.kickPrj" line={3} expect="ROOT name=">
+
+```xml
+<ROOT name="gg" manufacturer="Musictribe" version="0.1" bpm="120.0"
+```
+
+</CodeRef>
+
+The file is 11 lines. It has `BUSES` and a `FILEMANAGER` with three empty children, and nothing else. No sequences, no programs, no tempo nodes. The other nodes appear because of `getOrCreateChildWithName` above, and they reach the file at the next save. This is the first example of a pattern you will meet again: the code builds defaults on load, and the file only has to hold what differs.
+
+One more thing about that file. It carries `bpm`, `length`, `num` and `den` as attributes of `ROOT`. The engine's tempo code reads those from a `TEMPO` child instead:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_transport.cpp" line={155} expect="IDs::TEMPO">
+
+```cpp
+vTree.getOrCreateChildWithName( IDs::TEMPO, nullptr );
+```
+
+</CodeRef>
+
+I could not tell whether anything still reads the attributes on `ROOT`. They may be left over from an older layout. That is an open question, and it is the sort of thing a migration step would settle.
+
+## CachedValue: typed access to a property
+
+A property is stored as a loosely typed value. Reading `probability` as an integer, with a default when the property is missing and a clamp to a legal range, is something every reader would otherwise redo by hand. JUCE has a helper, `CachedValue<T>`, for this. The KICK carries its own adapted copy, with one added feature:
+
+<CodeRef path="Kick/modules/common/source/kick_CachedValue.h" line={62} expect="onValueChange">
+
+```cpp
+sigslot::signal<> onValueChange = {};
+```
+
+</CodeRef>
+
+The added feature is that signal. Other code can connect to it and hear about a change without being a ValueTree listener itself.
+
+A `CachedValue` does three jobs.
+
+1. **It remembers the value in its real type.** Reading it is a plain member read, with no lookup.
+2. **It supplies a default when the property is missing.** Here is the read path:
+
+<CodeRef path="Kick/modules/common/source/kick_CachedValue.h" line={211} expect="getPropertyPointer( targetProperty )">
+
+```cpp
+if( const juce::var* property = targetTree.getPropertyPointer( targetProperty ) )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/common/source/kick_CachedValue.h" line={214} expect="return defaultValue;">
+
+```cpp
+return defaultValue;
+```
+
+</CodeRef>
+
+3. **It keeps itself fresh.** It is a tree listener, and when its own property changes it refreshes its copy:
+
+<CodeRef path="Kick/modules/common/source/kick_CachedValue.h" line={220} expect="forceUpdateOfCachedValue();">
+
+```cpp
+forceUpdateOfCachedValue();
+```
+
+</CodeRef>
+
+The type argument can also clamp. A note's probability is declared as a `CachedValue<MidiConstrainer>`, which forces every value into the MIDI range:
+
+<CodeRef path="Kick/modules/engine/interface/source/mt_audio_interface_types.h" line={665} expect="probability;">
+
+```cpp
+CachedValue<MidiConstrainer>    probability;
+```
+
+</CodeRef>
+
+The default is the part to remember for later. Because a missing property reads as its default, a file written before a field existed still loads. That is the closest thing this code base has to a migration strategy, and the customization section builds on it.
+
+## Undo: edits as transactions
+
+An **UndoManager** keeps a list of edits so they can be reversed. The edits are grouped into **transactions**. One undo step reverses one transaction. A transaction can hold many small edits, such as dragging a slider through twenty values.
+
+When you pass an UndoManager to `setProperty`, JUCE records an edit object holding the old and new values. Pass `nullptr` and nothing is recorded (general JUCE knowledge). That explains why you saw `&undoManager` in every setup call above, and `nullptr` in the `getOrCreateChildWithName` calls: creating the empty child is not an edit the user made, so it stays out of the history.
+
+### Where one step ends and the next begins
+
+JUCE adds each recorded edit to the current transaction until someone calls `beginNewTransaction` (I checked this against the `UndoManager::perform` source in a JUCE 8.0.8 checkout, not the JUCE version the KICK pins, which is not in the repository). So the code has to draw the lines itself. The KICK's `CachedValue` does it on every write:
+
+<CodeRef path="Kick/modules/common/source/kick_CachedValue.h" line={135} expect="beginTransactionForUndo();">
+
+```cpp
+beginTransactionForUndo();
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/common/source/kick_CachedValue.h" line={136} expect="targetTree.setProperty(">
+
+```cpp
+targetTree.setProperty( targetProperty, juce::VariantConverter<Type>::toVar( newValue ), undoManagerToUse );
+```
+
+</CodeRef>
+
+So each assignment through a `CachedValue` is its own undo step. Other code skips the helper and writes to the tree directly. The list-edit screen does this when you change a note's probability:
+
+<CodeRef path="Kick/modules/kick_ui/modes/kick_ListEdit.cpp" line={452} expect="mt::IDs::probability">
+
+```cpp
+if( vt.isValid() ) vt.setProperty( mt::IDs::probability, V, &mt::getAudioInterface().getUndoManager() );
+```
+
+</CodeRef>
+
+That line passes the manager but does not begin a transaction. By the JUCE rule above, a run of such edits can merge into whatever transaction was already open. I read it that way and did not run it, so treat "may merge" as my reading. It is a good place to test on a real unit: change three values in the list view, press undo once, and see how many come back.
+
+### Pressing undo
+
+The manager wraps the JUCE calls with a guard:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={254} expect="undoManager.canUndo()">
+
+```cpp
+if( undoManager.canUndo() )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={255} expect="undoManager.undo();">
+
+```cpp
+undoManager.undo();
+```
+
+</CodeRef>
+
+The main screen calls that function and then tells the visible page to redraw itself by hand:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppMainMode.cpp" line={319} expect="ae.performUndo();">
+
+```cpp
+ae.performUndo();
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppMainMode.cpp" line={323} expect="refresh();">
+
+```cpp
+pSeq->refresh();
+```
+
+</CodeRef>
+
+The undo button also grays itself out when there is nothing to undo:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppMainMode.cpp" line={379} expect="um.canUndo()">
+
+```cpp
+mt::utils::setEnabled( um.canUndo(), undo );
+```
+
+</CodeRef>
+
+### What undo actually does to the rest of the program
+
+Undo does not restore a snapshot of the program. It replays property changes backwards. Each replayed change fires the same listeners as the original edit. That is why a derived value stays correct. A track keeps a scaled copy of its level, and it recalculates when the `level` property changes:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp" line={160} expect="levelScaler = ( level.get() * MIDI::SCALER );">
+
+```cpp
+levelScaler = ( level.get() * MIDI::SCALER );
+```
+
+</CodeRef>
+
+The rule that follows: derived data must be rebuilt from a listener, not at the place where the user's edit happens. If a derived value is only set in the button handler, undo will skip it and the program will disagree with itself.
+
+### When the data is not a property
+
+Audio does not fit in a tree. A sample edit such as normalizing a region rewrites a file. For that, the code defines its own undoable action by deriving from JUCE's `UndoableAction`:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_sample_editor_actions.h" line={34} expect="public juce::UndoableAction">
+
+```cpp
+class MTSampleEditUndoAction : public juce::UndoableAction{
+```
+
+</CodeRef>
+
+It starts its own transaction and hands the action to the same manager, so sample edits and property edits share one history:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_sample_editor_interface.cpp" line={231} expect="beginNewTransaction();">
+
+```cpp
+getAudioInterface().getUndoManager().beginNewTransaction();
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_sample_editor_interface.cpp" line={234} expect="perform( action )">
+
+```cpp
+performed = getAudioInterface().getUndoManager().perform( action );
+```
+
+</CodeRef>
+
+The original audio is backed up to a file next to the sample being edited:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_sample_editor_actions.cpp" line={21} expect="undo_sampleeditor.wav">
+
+```cpp
+undoFile = actionImp->getSourceFile().getSiblingFile( "undo_sampleeditor.wav" );
+```
+
+</CodeRef>
+
+So the undo history for a sample edit lives partly on disk, in a file whose name is the same for every edit in a folder. I did not trace how the file is cleaned up if the unit loses power in the middle of an edit.
+
+### What is not undoable, and when history is dropped
+
+Loading a project throws the history away:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={158} expect="undoManager.clearUndoHistory();">
+
+```cpp
+undoManager.clearUndoHistory();
+```
+
+</CodeRef>
+
+Some writes are never recorded in the first place. The program-level atomics for gain, pan and pitch are attached with a null undo manager:
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_iprogram_atomics.h" line={51} expect="auto Undo = nullptr;">
+
+```cpp
+auto Undo = nullptr;
+```
+
+</CodeRef>
+
+So a change to those values made through these wrappers does not appear in the undo list. Settings are the same: every settings sub-tree is set up with `nullptr`.
+
+<CodeRef path="Kick/modules/engine/project/kick_settings.cpp" line={43} expect="IDs::PROJECTDEFAULTS, nullptr ), nullptr );">
+
+```cpp
+projects.setup( getState().getOrCreateChildWithName( IDs::PROJECTDEFAULTS, nullptr ), nullptr );
+```
+
+</CodeRef>
+
+## How state reaches the audio side
+
+Here the gap from earlier opens. A ValueTree is not safe to use from several threads at once (general JUCE knowledge). The audio thread has strict rules: no locks, no memory allocation, no waiting (Module 6). So the audio side cannot simply read the tree. The code uses three roads, and one of them has a trap.
+
+The Module 6 lesson also covers a fourth road, the lock-free queue for graph edits. I leave that one there. The public `AudIO/` folder is partial, so for anything past the point where a value enters the graph I stop at the code under `Kick/` and send you to Module 6 and Module 7.
+
+<figure class="kd">
+  <div class="kd-row two">
+    <div class="kd-node layer-message"><b>Message thread</b>writes a property</div>
+    <div class="kd-wire"><span>mirror</span></div>
+    <div class="kd-node layer-storage"><b>ValueTree</b>shared handle</div>
+  </div>
+  <div class="kd-row two">
+    <div class="kd-node layer-storage"><b>Atomic mirror</b>one number per property</div>
+    <div class="kd-wire"><span>load()</span></div>
+    <div class="kd-node layer-audio"><b>Audio thread</b>reads, never waits</div>
+  </div>
+  <div class="kd-legend"><span><i></i>data</span><span><i class="control"></i>control</span><span><i class="clock"></i>clock</span></div>
+  <figcaption>Road one. The tree is written on one side. A small atomic copy of each audio-relevant value is what the audio side reads.</figcaption>
+</figure>
+
+### Road one: atomic mirrors
+
+`mt::Atomic<T>` is a wrapper holding a plain `std::atomic<T>`. It binds that atomic to one tree property:
+
+<CodeRef path="Kick/modules/common/source/kick_atomics.h" line={141} expect="new VTPropertyValueSource( Tree, Property, Undo, true, DefaultValue )">
+
+```cpp
+value.referTo( juce::Value( new VTPropertyValueSource( Tree, Property, Undo, true, DefaultValue ) ) );
+```
+
+</CodeRef>
+
+The `true` is the "update synchronously" flag. The source forwards a property change to the wrapper using that flag:
+
+<CodeRef path="Kick/modules/common/source/kick_atomics.h" line={58} expect="sendChangeMessage( updateSynchronously );">
+
+```cpp
+sendChangeMessage( updateSynchronously );
+```
+
+</CodeRef>
+
+When it fires, the synchronizer copies the new value into the atomic:
+
+<CodeRef path="Kick/modules/common/source/kick_atomics.h" line={102} expect="fromVar( value.getValue() )">
+
+```cpp
+atomic = juce::VariantConverter<Type>::fromVar( value.getValue() );
+```
+
+</CodeRef>
+
+The audio side reads with a plain atomic load:
+
+<CodeRef path="Kick/modules/common/source/kick_atomics.h" line={169} expect="Type get() const { return atomic.load(); }">
+
+```cpp
+Type get() const { return atomic.load(); }
+```
+
+</CodeRef>
+
+A real reader is the drum voice. In its per-block `process`, it loads the master gains at the top:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/drum_voice.cpp" line={165} expect="master.gainL.load()">
+
+```cpp
+const auto masterGainL      = master.gainL.load();
+```
+
+</CodeRef>
+
+That is the whole trick. The writer pays the cost (a tree write plus an atomic store). The reader pays almost nothing. Which thread does the store? With the synchronous flag, the thread that wrote the property does it, because I read no hop to another thread in these lines. So if the tree is written from a worker thread, the mirror updates on that worker thread. The atomic makes that safe for a single number.
+
+Notice one limit. The pan and gain mirrors also recompute two derived atomics, `gainL` and `gainR`, in a callback. Those are two separate atomics. A reader could in principle see one updated and one not for a block. I did not test whether that is audible.
+
+### Road two, and its trap: AtomicString
+
+There is a string twin of the wrapper, `AtomicString`. The name promises more than the code delivers. Look at its storage:
+
+<CodeRef path="Kick/modules/common/source/kick_atomics.h" line={250} expect="juce::String            atomic;">
+
+```cpp
+juce::String            atomic;
+```
+
+</CodeRef>
+
+It is a plain `juce::String`, not an atomic. Nothing makes it safe to read on one thread while another thread assigns to it. Treat `AtomicString` as a convenience for the message thread, and never read one on the audio thread. The settings structs use it for things like the saved project name and the Wi-Fi fields, which are read from the UI.
+
+### Road three: another thread reads the tree directly
+
+The notes are not played by the audio callback itself. A separate thread walks the sequence. It is created in the transport manager's constructor:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={67} expect="new std::thread( tickProcessingFunc )">
+
+```cpp
+tickProcessingThread    = new std::thread( tickProcessingFunc );
+```
+
+</CodeRef>
+
+It loops until told to stop, waking on each tick of the clock:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={286} expect="while( !stopTickProcessing )">
+
+```cpp
+while( !stopTickProcessing )
+```
+
+</CodeRef>
+
+On each tick, a track looks at the notes under that tick and rolls the dice against each note's probability. The probability it reads is the note's `CachedValue`, kept fresh by the listener described earlier:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp" line={301} expect="probability.get()">
+
+```cpp
+if( rand <= it->probability.get() )
+```
+
+</CodeRef>
+
+This closes the loop for the opening example. The list-edit widget writes the property (line 452 of the list-edit file, shown earlier). The note's `CachedValue` refreshes (kick_CachedValue.h line 220). The tick thread reads the cached copy a moment later.
+
+Now the part I would check on a real unit. How does the tick thread find the notes? Through a map of start position to notes, and the lookup takes no lock:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_note.h" line={145} expect="getNotesAtPos( int start )">
+
+```cpp
+inline juce::HashMap<int, MTNote*>* getNotesAtPos( int start )
+```
+
+</CodeRef>
+
+The editing functions on the other side do take a lock, the note list's own:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_note.cpp" line={1029} expect="juce::ScopedLock sl{ lock };">
+
+```cpp
+juce::ScopedLock sl{ lock };
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_note.h" line={200} expect="juce::CriticalSection lock;">
+
+```cpp
+juce::CriticalSection lock;
+```
+
+</CodeRef>
+
+And the track's per-tick function takes a lock too, but it is a different one, a member of the track class:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp" line={347} expect="const juce::ScopedLock sl( lock );">
+
+```cpp
+const juce::ScopedLock sl( lock );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.h" line={149} expect="juce::CriticalSection lock;">
+
+```cpp
+juce::CriticalSection lock;
+```
+
+</CodeRef>
+
+Two locks guard the same data only if both sides take the same one. Here the editor takes the note list's lock and the tick thread takes the track's. From reading, they do not exclude each other, and the note lookup takes neither. I have not run this, and I am not claiming a crash. I am saying the protection is not what it looks like at a glance. Deleting notes while a sequence plays is the test I would try.
+
+### The project load runs on its own thread
+
+One more thread fact. Opening a project does not happen on the message thread. The loader class derives from `juce::Thread`:
+
+<CodeRef path="Kick/modules/kick_ui/recent_project/kick_RecentProject_Utils.h" line={6} expect="private juce::Thread">
+
+```cpp
+, private juce::Thread
+```
+
+</CodeRef>
+
+and its `run` calls the engine:
+
+<CodeRef path="Kick/modules/kick_ui/recent_project/kick_RecentProject_Utils.cpp" line={42} expect="loadProject( proj );">
+
+```cpp
+mt::getAudioInterface().loadProject( proj );
+```
+
+</CodeRef>
+
+So the tree is built and its listeners fire on a worker thread, while the screens exist on the message thread. The load function sleeps for half a second in the middle, which is fine on a worker and would freeze the display on the message thread (Module 4):
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={184} expect="sleep_for( std::chrono::milliseconds( 500 ) )">
+
+```cpp
+std::this_thread::sleep_for( std::chrono::milliseconds( 500 ) );
+```
+
+</CodeRef>
+
+## Saving and loading a project
+
+### The file
+
+A project is a text file in **XML**. The demo file above begins with an XML declaration and a `ROOT` element. The extension is `.kickPrj`:
+
+<CodeRef path="Kick/modules/engine/project/project.h" line={33} expect=".kickPrj">
+
+```cpp
+static const char* const __projectFileExtension = ".kickPrj";
+```
+
+</CodeRef>
+
+A project is a folder. The file inside has the same name as the folder plus the extension:
+
+<CodeRef path="Kick/modules/engine/project/kick_xml_manager.cpp" line={65} expect="xmlFileDir.getFileName() + extn">
+
+```cpp
+auto fileName = xmlFileDir.getFileName() + extn;
+```
+
+</CodeRef>
+
+On Linux, projects are created under `/home/Kick/projects/`:
+
+<CodeRef path="Kick/modules/common/source/kick_paths.cpp" line={69} expect="/home/Kick/projects/">
+
+```cpp
+return juce::File( "/home/Kick/projects/" );
+```
+
+</CodeRef>
+
+A new project folder is that path plus the name the user typed:
+
+<CodeRef path="Kick/modules/kick_ui/recent_project/kick_RecentProject.cpp" line={126} expect="getAppDirs( MTProjects )">
+
+```cpp
+juce::File file        = getAppDirs( MTProjects ).getFullPathName() + sepratorStr + value;
+```
+
+</CodeRef>
+
+### Loading
+
+The load function runs these steps in order:
+
+1. `closeProject()` first, which saves the old project.
+2. Clear the undo history (shown above).
+3. Ask the project manager to open the file.
+4. Set up each sub-manager from its child node (shown above).
+
+Step three is where the XML turns into a tree:
+
+<CodeRef path="Kick/modules/engine/project/kick_xml_manager.cpp" line={82} expect="ValueTree::fromXml(">
+
+```cpp
+vt = juce::ValueTree::fromXml( xmlFile.loadFileAsString() );
+```
+
+</CodeRef>
+
+The very next steps use the result without checking that it parsed. If the file were damaged, `fromXml` would hand back an empty tree (general JUCE knowledge), and I found no code that notices. I did not test what happens next.
+
+The project manager then makes sure a `Project` node exists and puts a version in it:
+
+<CodeRef path="Kick/modules/engine/project/project.cpp" line={75} expect="juce::ValueTree( IDs::Project )">
+
+```cpp
+auto project = juce::ValueTree( IDs::Project );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/project/project.cpp" line={76} expect="IDs::version, __projectVersion">
+
+```cpp
+project.setProperty( IDs::version, __projectVersion, nullptr );
+```
+
+</CodeRef>
+
+There are two version numbers. The file format is `0.1` and the project is `1.0.0`:
+
+<CodeRef path="Kick/modules/engine/project/project.h" line={34} expect="0.1">
+
+```cpp
+static const char* const __projectFileVersion   = "0.1";
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/project/project.h" line={35} expect="1.0.0">
+
+```cpp
+static const char* const __projectVersion       = "1.0.0";
+```
+
+</CodeRef>
+
+A search for `IDs::version` across `Kick/` finds writes only: one when a file is created and one for the `Project` node above. I found no place that reads either number and branches on it. So today the version fields are labels, and nothing migrates an old file.
+
+### Saving
+
+Saving has three triggers.
+
+**A change, through autosave.** The file manager listens to the whole tree. It is built on a listener that turns every kind of change into one callback:
+
+<CodeRef path="Kick/modules/common/source/kick_ValueTreeUtils.h" line={30} expect="valueTreeChanged();">
+
+```cpp
+void valueTreePropertyChanged( juce::ValueTree&, const juce::Identifier& ) override { valueTreeChanged(); }
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/project/kick_xml_manager.cpp" line={27} expect="vt.addListener( this );">
+
+```cpp
+vt.addListener( this );
+```
+
+</CodeRef>
+
+When it fires, the first thing the callback does is serialize the whole tree to a string:
+
+<CodeRef path="Kick/modules/engine/project/kick_xml_manager.cpp" line={38} expect="vt.toXmlString();">
+
+```cpp
+auto xml = vt.toXmlString();
+```
+
+</CodeRef>
+
+That variable is never used again in the function. As written, every edit builds the full project text and throws it away. I did not measure the cost, and a compiler may or may not remove it, but on a large project it is the first thing I would look at when edits feel slow.
+
+Then, if autosave is on, it starts a timer, but only when none is running:
+
+<CodeRef path="Kick/modules/engine/project/kick_xml_manager.cpp" line={46} expect="!timer.isTimerRunning()">
+
+```cpp
+if( !timer.isTimerRunning() )
+```
+
+</CodeRef>
+
+The default delay is 1.5 seconds:
+
+<CodeRef path="Kick/modules/engine/project/kick_xml_manager.cpp" line={35} expect="autoSaveTimeOutInMS{ 1500 }">
+
+```cpp
+int  KickXML::autoSaveTimeOutInMS{ 1500 };
+```
+
+</CodeRef>
+
+Because a second edit does not restart the timer, this works as a throttle, not a debounce: one save per window, counted from the first edit. When the timer fires, it hands off to an async update, and that stops the timer and saves:
+
+<CodeRef path="Kick/modules/engine/project/kick_xml_manager.cpp" line={53} expect="timer.stopTimer();">
+
+```cpp
+timer.stopTimer();
+```
+
+</CodeRef>
+
+**The hardware Save button.** The device sends a save code and the home screen calls the engine:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={432} expect="ae.saveProject();">
+
+```cpp
+ae.saveProject();
+```
+
+</CodeRef>
+
+**Closing and shutting down.** Closing a project saves it first:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={220} expect="projectManager::close();">
+
+```cpp
+projectManager::close();
+```
+
+</CodeRef>
+
+and the file manager's destructor saves again:
+
+<CodeRef path="Kick/modules/engine/project/kick_xml_manager.cpp" line={32} expect="save();">
+
+```cpp
+save();
+```
+
+</CodeRef>
+
+### The save itself
+
+The `save` function builds the text, compares it with what is on disk, and writes only if they differ:
+
+<CodeRef path="Kick/modules/engine/project/kick_xml_manager.cpp" line={96} expect="fxml.compare( xml )">
+
+```cpp
+if( fxml.compare( xml ) )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/project/kick_xml_manager.cpp" line={97} expect="replaceWithText( xml )">
+
+```cpp
+xmlFile.replaceWithText( xml );
+```
+
+</CodeRef>
+
+The comparison costs a full read of the old file on every save, in exchange for skipping redundant writes. On flash that trade is reasonable, since fewer writes means less wear.
+
+### Autosave defaults need a second look
+
+Autosave has two switches that disagree. The save flag inside the file manager is a static shared by the project and the settings objects. It starts as `true`:
+
+<CodeRef path="Kick/modules/engine/project/kick_xml_manager.cpp" line={34} expect="KickXML::autoSave{ true }">
+
+```cpp
+bool KickXML::autoSave{ true };
+```
+
+</CodeRef>
+
+The user-facing "Auto Save" toggle lives in settings, and its stored default is off:
+
+<CodeRef path="Kick/modules/engine/project/kick_settings.cpp" line={92} expect="isAutoSave.attachTo( vTree, IDs::Autosave, Undo, false );">
+
+```cpp
+isAutoSave.attachTo( vTree, IDs::Autosave, Undo, false );
+```
+
+</CodeRef>
+
+When the settings screen is built, it copies that stored value onto the static flag:
+
+<CodeRef path="Kick/modules/kick_ui_settings/source/kick_ui_settings_defaults.cpp" line={40} expect="settings.setAutoSave(">
+
+```cpp
+settings.setAutoSave( asEnabled.getToggleState() );
+```
+
+</CodeRef>
+
+So the flag starts on, and once the settings page exists it follows the preference, which reads as off on a fresh unit. I did not run it, so I cannot say what a new unit does between those two moments. Read it as: with autosave off, a project is saved by the Save button and when it is closed. That is worth knowing before you trust the 1.5 second number.
+
+### How samples are referenced
+
+A project does not embed audio. It holds a list of `FILE` nodes, each with a `path` property:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/mt_audio_asset_manager.cpp" line={176} expect="IDs::path, File );">
+
+```cpp
+IDs::path, File );
+```
+
+</CodeRef>
+
+The file browser passes the full path of the chosen file when it adds one:
+
+<CodeRef path="Kick/modules/kick_ui/modes/filebrowser/kick_fileBrowser.cpp" line={664} expect="getFullPathName()">
+
+```cpp
+ae.addAsset( assetFile.getFullPathName(), mt::AssetTypes::Samples );
+```
+
+</CodeRef>
+
+I found no code that rewrites that into a path relative to the project folder or copies the sample into the project. If a sample lives on a USB stick, the project stores the stick's path. My expectation is that the sample is missing when the stick is out. I did not test it.
+
+## Settings versus project
+
+A second file holds the unit's own preferences. It uses the same file manager, with a different root type and extension:
+
+<CodeRef path="Kick/modules/engine/project/kick_settings.cpp" line={34} expect="KickXML( IDs::PREFERENCES, __settingsFileSuffix, __settingsFileVersion )">
+
+```cpp
+: KickXML( IDs::PREFERENCES, __settingsFileSuffix, __settingsFileVersion )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/project/kick_settings.h" line={19} expect=".settingsprj">
+
+```cpp
+const juce::String __settingsFileSuffix( ".settingsprj" );
+```
+
+</CodeRef>
+
+It is opened from the preferences folder:
+
+<CodeRef path="Kick/modules/engine/project/kick_settings.cpp" line={54} expect="getAppDirs( MTPrefs )">
+
+```cpp
+auto settingsFile = getAppDirs( MTPrefs ).getChildFile( __settingsFileName );
+```
+
+</CodeRef>
+
+On Linux that folder is `/home/Kick/prefs`:
+
+<CodeRef path="Kick/modules/common/source/kick_paths.cpp" line={73} expect="/home/Kick/prefs">
+
+```cpp
+return juce::File( "/home/Kick/prefs" );
+```
+
+</CodeRef>
+
+By my reading of the file manager's naming rule, the settings file ends up at `/home/Kick/prefs/preferences/preferences.settingsprj`. I derived that path from the code and did not look at a unit.
+
+Module 4 showed that the app builds the settings object first, with `mt::getSettings()`:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={142} expect="mt::getSettings();">
+
+```cpp
+mt::getSettings();
+```
+
+</CodeRef>
+
+The recent-projects list lives in settings, not in the project. Each entry is a child node with a path property:
+
+<CodeRef path="Kick/modules/engine/project/kick_settings.cpp" line={129} expect="newEntry(">
+
+```cpp
+juce::ValueTree newEntry( "Entry" );
+```
+
+</CodeRef>
+
+| | Project | Settings |
+|---|---|---|
+| Root node | `ROOT` | `PREFERENCES` |
+| File | `<name>.kickPrj`, inside a folder of the same name | `.settingsprj` |
+| Folder | `/home/Kick/projects/` | `/home/Kick/prefs` |
+| Reached through | the audio interface | `mt::getSettings()` |
+| Undoable | yes, passes the undo manager | no, passes `nullptr` |
+| Holds | sequences, programs, tempo, sample list | defaults, recent projects, MIDI and hardware prefs |
+
+One more warning about settings. The tree has a property for a Wi-Fi password:
+
+<CodeRef path="Kick/modules/engine/project/kick_settings.cpp" line={384} expect="IDs::wifipasswd">
+
+```cpp
+pwd.attachTo( vTree, IDs::wifipasswd, Undo, "" );
+```
+
+</CodeRef>
+
+Everything in the tree reaches the file as plain XML text. I did not check whether the app fills that property on a real unit. The point for your own work: anything you put in a tree is readable in the file.
+
+## Where the files live on the device
+
+The app's paths are in the code above. What backs those paths comes from the systemd units that Module 2 introduced. This section puts the two together and marks what is still missing.
+
+**The KICK storage partition.** It is mounted by partition ID, not by device name:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/media-kickstorage.mount" line={11} expect="PARTUUID=56d2e551-db06-46da-bb58-274c6ee725d2">
+
+```text
+What=PARTUUID=56d2e551-db06-46da-bb58-274c6ee725d2
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/media-kickstorage.mount" line={12} expect="Where=/media/kickstorage">
+
+```text
+Where=/media/kickstorage
+```
+
+</CodeRef>
+
+That ID is the one the image recipe gives to the partition it calls `usr`:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/genimage.cfg.emmc.partiton.table" line={34} expect="56d2e551-db06-46da-bb58-274c6ee725d2">
+
+```text
+partition-uuid = 56d2e551-db06-46da-bb58-274c6ee725d2
+```
+
+</CodeRef>
+
+That partition is set to grow to fill the disk:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/genimage.cfg.emmc.partiton.table" line={35} expect="autoresize">
+
+```text
+autoresize = "true"
+```
+
+</CodeRef>
+
+On first boot a service formats it, but only if it has no filesystem yet:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/usr/bin/kick-storage-mkfs" line={6} expect="e2label">
+
+```sh
+if ! /sbin/e2label "$part" >/dev/null 2>&1; then
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/usr/bin/kick-storage-mkfs" line={7} expect="mkfs.ext4 -L kickstorage">
+
+```sh
+exec mkfs.ext4 -L kickstorage "$part"
+```
+
+</CodeRef>
+
+What does the code put on that partition? The overlay mounts for `/etc` and `/var` keep their writable layer there:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/etc.mount" line={14} expect="upperdir=/media/kickstorage/overlay/etc/upper">
+
+```text
+Options=lowerdir=/etc,upperdir=/media/kickstorage/overlay/etc/upper,workdir=/media/kickstorage/overlay/etc/work
+```
+
+</CodeRef>
+
+I searched the app code for `/media/kickstorage` and found no use of it. So this partition is for the system's writable layers, not for projects. The app's data goes elsewhere.
+
+**Where `/home/Kick` comes from.** The app's project and preference folders are both under `/home/Kick`. A mount unit named `usr.mount` mounts `/dev/mmcblk1p7` there, despite its name:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/usr.mount" line={8} expect="What=/dev/mmcblk1p7">
+
+```text
+What=/dev/mmcblk1p7
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/usr.mount" line={9} expect="Where=/home/Kick">
+
+```text
+Where=/home/Kick
+```
+
+</CodeRef>
+
+The two other units from the open question in Module 2 turn out to be the same family. Partition 6 goes to `/opt` and partition 8 goes to `/data`:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/opt.mount" line={9} expect="Where=/opt">
+
+```text
+Where=/opt
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/data.mount" line={9} expect="Where=/data">
+
+```text
+Where=/data
+```
+
+</CodeRef>
+
+The app's sample library path is `/data/sounds` (kick_paths.cpp, same function as the lines above). So the three units tell you what each mount is for. They do not answer the real question, which is whether partitions 6 to 8 exist. The image recipe defines the root filesystem and one more partition, and the boot image is written raw outside the table:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/genimage.cfg.emmc.partiton.table" line={20} expect="in-partition-table">
+
+```text
+in-partition-table = "no"
+```
+
+</CodeRef>
+
+<Aside type="caution" title="Open question, narrowed">
+Module 2 asked what creates partitions 6 to 8. Now I know what they are for: `/opt`, `/home/Kick` and `/data`. I still cannot see in the repository what creates them. The partition table I found has two entries, and neither is numbered 7. If `/dev/mmcblk1p7` does not exist on a unit, I cannot tell from the repo what backs `/home/Kick`, which is where every project and preference file is written. Check this on a real unit with `lsblk` and `findmnt /home/Kick`. I have not.
+</Aside>
+
+**The USB stick.** The app expects an attached stick at `/mnt/flash`:
+
+<CodeRef path="Kick/modules/hardware/source/kick_Hwcommon.h" line={27} expect="USBDISK_PATH">
+
+```c
+#define USBDISK_PATH "/mnt/flash"
+```
+
+</CodeRef>
+
+I found no mount unit or rule for that path in the root filesystem overlay, so what mounts a stick there is something I did not find.
+
+**A factory reset deletes projects.** The reset command removes the project folders and the preference folder:
+
+<CodeRef path="Kick/modules/hardware/source/kick_Hwpref.cpp" line={28} expect="/bin/rm -rf /home/Kick/projects*">
+
+```cpp
+const char* FACTORY_RESET_CMD = "/bin/rm -rf /home/Kick/projects* /home/Kick/prefs";
+```
+
+</CodeRef>
+
+## What survives a power cut
+
+I will only claim what the code shows, and I will say where the claim stops.
+
+**What the code shows.**
+
+- A save serializes the tree and calls `replaceWithText` (kick_xml_manager.cpp, lines 94 to 97, cited above).
+- With autosave on, the gap between an edit and the next write is at least the timer delay, 1.5 seconds by default. Edits made in that window exist only in memory.
+- With autosave off, edits wait for the Save button or for a project close.
+- I found no backup copy of the previous file and no check that a loaded file parsed.
+
+**What JUCE does underneath (general knowledge, not the KICK repository).** I read the JUCE 8.0.8 source in a local checkout. `File::replaceWithText` writes the text to a hidden temporary file in the same folder, then swaps it in with a rename. The KICK's pinned JUCE version is not in this repository, so the details may differ. Rename on one filesystem is atomic on Linux (general POSIX knowledge), which means a crash during the write should leave either the old file or the new one, not half of each. In the JUCE path I read, the temporary file's close does not call `fsync`, so whether the new bytes reached the flash before the rename did is up to the filesystem.
+
+**Where my claim stops.** I cannot tell you what the ext4 filesystem does with that ordering when power drops mid-write. I did not test a power cut on a unit. Treat "old or new file, never half a file" as what the design intends, and "the newest edits can be lost" as a given. Whether a zero-length file can appear is a question for a real unit and a fault-injection test.
+
+<Aside type="caution" title="Not verified on hardware">
+Everything about timing and power loss here comes from reading source. I did not run the app, time a save, or cut power. The paths come from the code and the mount units; I did not check them on a unit.
+</Aside>
+
+## Why it is built this way
+
+The design makes a clear trade. Putting everything in one ValueTree gives you three things for free: a save format (the tree is XML), an undo system (edits record themselves), and change notification (listeners). The cost is that the tree is not thread-safe, so every audio-facing value needs a separate mirror, and every mirror is another place for a bug. The three roads above are the price of that choice.
+
+The save design has a similar trade. Writing the whole project as one text file is simple and easy to inspect. It also means every save rewrites the full project, and a bigger project costs more per save.
+
+## Customization pointers
+
+- **Add a field to a note.** Declare an id with `DECLARE_ID`. Add a `CachedValue` member to `MTNote` and bind it in `MTNote::referTo` with a default, next to line 550. Write it in `MTNoteUtil::createVT`. Because a missing property reads as its default, old files keep loading. Start a transaction when your widget writes, or your change will merge with the one before it.
+- **Bump a version and migrate.** The hook is `projectManager::loadOrCreate`, right after the `Project` node check at line 71 of `project.cpp`. Read the old version from the node, convert the tree, then write the new version. Nothing reads the version today, so you are adding the first reader. Keep copies of the demo files as test inputs.
+- **Make autosave default on.** Change the default at the `Autosave` attach line in `kick_settings.cpp` (line 92 above). Check the static flag as well, since two switches exist.
+- **Make saves safer.** Copy the old file aside before `replaceWithText`, and check the tree is valid after `fromXml`. Then test with a power-cut rig.
+- **Store sample paths relative to the project.** The project folder is set up in `MTAudioAssetManager::setRootFolder`. Convert on add, convert back on load.
+- **Make a mirror honest.** Replace `AtomicString` with a design that does not claim to be atomic, or use it only from the message thread.
+
+## Try it yourself
+
+With the upstream clone checked out at the pinned commit, do a grep tour of one property from widget to disk. Run each command and write one sentence about what you found.
+
+```bash
+cd Kick
+# 1. The widget that writes it
+grep -n "IDs::probability" modules/kick_ui/modes/kick_ListEdit.cpp
+# 2. The identifier and the typed view of it
+grep -n "probability" modules/engine/interface/source/mt_audio_ids.h
+grep -n "probability" modules/engine/interface/source/mt_audio_interface_types.h
+# 3. Who reads it while playing
+grep -n "probability" modules/engine/audio_engine/engine/mt_audio_track.cpp
+# 4. What turns a tree change into a file write
+grep -n "valueTreeChanged" modules/engine/project/kick_xml_manager.cpp
+grep -n "replaceWithText" modules/engine/project/kick_xml_manager.cpp
+```
+
+Then answer these.
+
+1. Which thread runs the widget callback in step 1? Which thread reads the value in step 3?
+2. In step 1, does the write begin a new undo transaction? If not, what would you add?
+3. Open `Demo 01.kickPrj`. List the nodes it has, then the nodes the loader adds that it does not have.
+4. Pick a different property, such as `ratchet`, and repeat the tour. Do the same files appear?
+
+## Check yourself
+
+<Quiz
+  items={[
+    {
+      q: 'A property is written with setProperty( id, value, nullptr ). What does that mean for undo?',
+      options: [
+        'The change is undoable, but only once',
+        'The change is not recorded in the undo history',
+        'The change is saved to disk immediately',
+        'The change is rejected',
+      ],
+      answer: 1,
+      why: 'The last argument is the UndoManager. With nullptr there is no manager to record the edit. The settings and the program atomics use this on purpose.',
+    },
+    {
+      q: 'Why can the audio side safely read mt::Atomic<float>::get() but not an AtomicString?',
+      options: [
+        'Floats are faster than strings',
+        'The float is stored in a std::atomic, while the AtomicString stores a plain juce::String',
+        'AtomicString is only used for the disk file',
+        'The audio thread cannot read strings at all',
+      ],
+      answer: 1,
+      why: 'Atomic<T> holds a std::atomic<T> and reads it with load(). AtomicString holds an ordinary String, so reading it while another thread assigns it is not safe.',
+    },
+    {
+      q: 'With autosave on and the default delay, what happens after you make three quick edits?',
+      options: [
+        'Three saves, one per edit',
+        'No save until you press Save',
+        'One timer starts at the first edit, and one save follows when it fires',
+        'The timer restarts on each edit, so the save waits for a pause',
+      ],
+      answer: 2,
+      why: 'The callback only starts the timer if none is running, so later edits do not restart it. It behaves like a throttle. When it fires, the save compares text and writes only if the file differs.',
+    },
+    {
+      q: 'Which statement does the repository support about where project files live?',
+      options: [
+        'Projects are written to /media/kickstorage',
+        'The app writes projects under /home/Kick/projects/, and a mount unit sends /dev/mmcblk1p7 to /home/Kick, but I could not find what creates partition 7',
+        'Projects are written to the USB stick at /mnt/flash',
+        'Projects are stored in a binary database on the boot partition',
+      ],
+      answer: 1,
+      why: 'The path is in kick_paths.cpp and the mount unit names p7. The partition table in the repo has no partition 7, so that link is an open question. Nothing in the app uses /media/kickstorage.',
+    },
+    {
+      q: 'Why does a sample edit use a custom UndoableAction instead of a property change?',
+      options: [
+        'Because the ValueTree cannot hold audio data, so the edit rewrites a file and needs its own way to reverse it',
+        'Because property changes cannot be undone at all',
+        'Because the sample editor runs on the audio thread',
+        'Because the undo manager only accepts custom actions',
+      ],
+      answer: 0,
+      why: 'A normalize or cut changes the audio file itself. The action backs the original up to a wav next to the sample and restores it on undo, and it shares the same UndoManager as the property edits.',
+    },
+  ]}
+/>
+
+## Words to know
+
+| Term | Meaning |
+|---|---|
+| State | The data that describes the current project and settings: what a screen shows, the engine plays and the disk keeps |
+| Single source of truth | One place where a piece of data lives. Everything else reads it there |
+| ValueTree | A JUCE tree of nodes. Each node has a type, named properties and child nodes, and listeners can watch it |
+| Identifier | A JUCE name type used for node types and property names |
+| Property | One named value stored on a node |
+| Listener | Code that registers to be told when something changes |
+| CachedValue | A typed wrapper over one property, with a default and a local copy of the value |
+| UndoManager | The JUCE object that records edits so they can be reversed |
+| Transaction | A group of edits that undo together as one step |
+| UndoableAction | A custom edit that knows how to apply and reverse itself, used when the data is not a property |
+| Atomic | A value that can be read and written by two threads without a lock. `std::atomic` in C++ |
+| Mirror | A small atomic copy of a tree property, made for the audio side to read |
+| Autosave | A timer that writes the project after a change. Throttled here, not debounced |
+| XML | A text format of nested elements. The project and settings files use it |
+| Atomic write | Writing a file so that readers see the old version or the new one, never a half-written file. Usually a temporary file plus a rename |
+| Mount | Attaching a disk partition to a folder path so files appear there |
+| Overlay | A mount that shows a writable layer on top of a read-only folder |
+
+Next: [Module 11, The camera](/kick-firmware-course/course/11-camera/).

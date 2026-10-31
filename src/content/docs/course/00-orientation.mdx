@@ -1,0 +1,432 @@
+---
+title: '0. Orientation'
+description: What the KICK is, what is in the public repository, what is missing, and how to read the rest of this course.
+---
+
+import { Image } from 'astro:assets';
+import { Aside } from '@astrojs/starlight/components';
+import CodeRef from '../../../components/CodeRef.astro';
+import Quiz from '../../../components/Quiz.astro';
+import hero from '../../../assets/heroes/m00-orientation.png';
+
+<Image src={hero} alt="A dark slab with its top lifted off, showing thin glowing teal layers stacked inside." />
+
+**Module 0 of 12 &#183; about 15 minutes &#183; no prerequisites**
+
+The KICK source code is public. That sounds like you can clone it, press build, and get a drum machine. You can't. Some pieces were never released, and one of the build steps points at a server that does not exist. I would rather you hear that in the first ten minutes than discover it in hour three.
+
+By the end of this module you will know what the KICK is, what each top-level folder holds, what is missing and why the repo does not build as shipped, and how every later lesson backs its claims.
+
+## What the KICK is
+
+The KICK is a sampler and sequencer sold by Behringer. The repository calls it the BE 0700-AAM. The README opens with one plain sentence:
+
+<CodeRef path="README.md" line={7} expect="Source code for the Behringer KICK.">
+
+```md
+Source code for the Behringer KICK.
+```
+
+</CodeRef>
+
+The software is a C++ application built on JUCE, a framework for audio apps and plugins:
+
+<CodeRef path="Kick/README.md" line={3} expect="written in C++ with">
+
+```md
+Application software for the BE 0700-AAM, written in C++ with [JUCE](https://juce.com).
+```
+
+</CodeRef>
+
+It runs on a custom Linux image made with Buildroot, a tool that builds a small Linux system from a config file:
+
+<CodeRef path="Linux/README.md" line={3} expect="Buildroot tree for the BE 0700-AAM Linux image.">
+
+```md
+Buildroot tree for the BE 0700-AAM Linux image.
+```
+
+</CodeRef>
+
+Two lines from the Buildroot config tell you more. The target CPU is 64-bit ARM, and the init system, the first program Linux starts, is systemd:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={1} expect="BR2_aarch64=y">
+
+```text
+BR2_aarch64=y
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={5} expect="BR2_INIT_SYSTEMD=y">
+
+```text
+BR2_INIT_SYSTEMD=y
+```
+
+</CodeRef>
+
+And the application's main class is a plain JUCE application:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={109} expect="class AudioEngineApplication : public juce::JUCEApplication">
+
+```cpp
+class AudioEngineApplication : public juce::JUCEApplication
+```
+
+</CodeRef>
+
+So the picture is: a Linux computer, no desktop, one big JUCE program that draws the touchscreen and makes the sound. I make no claim here about how that program is launched at boot. Module 2 reads that code.
+
+<Aside type="note" title="Analogy">
+Think of a restaurant. Buildroot Linux is the building: kitchen, plumbing, power. The KICK app is the chef. The control surface is the waiter who carries orders in from the floor. This course walks the whole building, but most of the interesting cooking is the chef's.
+</Aside>
+
+## The stack
+
+Every lesson places what it teaches on one of these layers. The colors are the same in every diagram.
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>Hardware</b><span class="layer layer-hardware">hardware</span><br />Main chip, control surface MCU, codec, touch, pads.</div>
+    <div class="kd-step"><b>Bootloader</b><span class="layer layer-bootloader">bootloader</span><br />The chain of small programs that starts Linux.</div>
+    <div class="kd-step"><b>Kernel</b><span class="layer layer-kernel">kernel</span><br />Linux itself: drivers, sound, device tree.</div>
+    <div class="kd-step"><b>User space</b><span class="layer layer-userspace">user space</span><br />systemd services and the KICK app.</div>
+    <div class="kd-step"><b>Message thread</b><span class="layer layer-message">message</span><br />The app thread that runs the UI and most calls.</div>
+    <div class="kd-step"><b>Audio thread</b><span class="layer layer-audio">audio</span><br />The real-time thread that renders sound.</div>
+  </div>
+  <figcaption>Bottom of the machine to top, left to right. Message and audio threads are JUCE concepts (general knowledge here). Later modules show them in the code.</figcaption>
+</figure>
+
+Storage, the eMMC and SD card, is a seventh color. It cuts across the stack, so it is not a step. You will meet it in the boot and update lessons.
+
+## The repo tour
+
+The README lists four top-level folders and their licenses:
+
+<CodeRef path="README.md" line={42} expect="| [`Kick/`](Kick) | Application | AGPL-3.0-or-later |">
+
+```md
+| [`Kick/`](Kick) | Application | AGPL-3.0-or-later |
+```
+
+</CodeRef>
+
+The tree has more than that. I listed it at the pinned commit. Here is every top-level entry and what it is for.
+
+| Path | What it holds |
+|---|---|
+| `Kick/` | The JUCE application: apps, modules, UI art, project templates, build scripts |
+| `AudIO/` | The audio engine library: audio objects, buses, a small DAW layer, 300+ Airwindows effects |
+| `ComProtocol/` | `PktMgr`, the packet protocol between the app and the control surface |
+| `Linux/` | The Buildroot tree: configs, boards, kernel and U-Boot patches, root filesystem overlay |
+| `docs/` | README images only |
+| `.github/` | `CODEOWNERS` and `dependabot.yml` |
+| `LICENSE`, `README.md` | AGPL-3.0 text and the product overview |
+
+Inside `Kick/` the two folders that matter most are `apps/` and `modules/`. Each executable gets a folder under `apps/`, and the default build adds these two first:
+
+<CodeRef path="Kick/apps/CMakeLists.txt" line={2} expect="add_subdirectory(kick)">
+
+```cmake
+add_subdirectory(kick)
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/apps/CMakeLists.txt" line={3} expect="add_subdirectory(kick_device_control)">
+
+```cmake
+add_subdirectory(kick_device_control)
+```
+
+</CodeRef>
+
+The application logic lives in `modules/`. A JUCE module is a folder with a header that declares its name and its dependencies. The module list starts here:
+
+<CodeRef path="Kick/modules/CMakeLists.txt" line={5} expect="hardware">
+
+```cmake
+hardware
+```
+
+</CodeRef>
+
+The audio engine library says what it is in its README:
+
+<CodeRef path="AudIO/README.md" line={3} expect="AudIO is the audio engine library used by Kick.">
+
+```md
+AudIO is the audio engine library used by Kick.
+```
+
+</CodeRef>
+
+And the protocol folder says the same about itself:
+
+<CodeRef path="ComProtocol/README.md" line={3} expect="framed packet protocol">
+
+```md
+`PktMgr` is the framed packet protocol (header, type, payload and CRC) used between the Kick application
+```
+
+</CodeRef>
+
+## What is not in the repo
+
+The release is a cleaned-up drop, not a full dump. Here is what I verified is absent, one item at a time.
+
+### The control surface firmware
+
+The small chip that reads pads and knobs has its own program. The app can send a new program to it, which is how I know it exists:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={112} expect="getSurfaceVersion">
+
+```cpp
+bool mcuFwStatus = ( isMCUImagePresent() && mt::HwPref::getHwPref().getSurfaceVersion().isNotEmpty() );
+```
+
+</CodeRef>
+
+The source for that chip's program is not in any of the four folders. Only the main computer's side of the conversation is public. Module 1 covers the link.
+
+### The camera and gesture code
+
+The README advertises it:
+
+<CodeRef path="README.md" line={15} expect="AI camera for gesture control">
+
+```md
+- AI camera for gesture control
+```
+
+</CodeRef>
+
+The Linux kernel config enables a driver for an OV5640 camera sensor:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={373} expect="CONFIG_VIDEO_OV5640=y">
+
+```text
+CONFIG_VIDEO_OV5640=y
+```
+
+</CodeRef>
+
+That is the whole camera story in this repository. I searched `Kick/`, `AudIO/` and `ComProtocol/` at the pinned commit for camera, `v4l2`, `/dev/video` and `ov5640` outside vendored third-party examples, and found no app code. No gesture model or inference library turned up either. The gesture feature may live in software that was not released.
+
+### Modules the code needs but the tree lacks
+
+Two JUCE modules are named as dependencies and have no folder anywhere in the tree. The audio interface module needs `AudIO_juce`:
+
+<CodeRef path="Kick/modules/audio_interface/audio_interface.h" line={17} expect="dependencies:       AudIO_juce">
+
+```text
+dependencies:       AudIO_juce
+```
+
+</CodeRef>
+
+The common module needs `AudIO_constants`:
+
+<CodeRef path="Kick/modules/common/common.h" line={17} expect="AudIO_constants">
+
+```text
+dependencies:       signal, fpm, magic_enum, AudIO_constants, juce_gui_basics
+```
+
+</CodeRef>
+
+I listed every path in the tree at the pinned commit and nothing is named `AudIO_juce`, `AudIO_constants`, or `juce_modules.cmake`. The `AudIO/` folder is a different layout from what `Kick` expects. I can't tell you from this repository how the original private AudIO repo mapped onto these names.
+
+A third module is missing on purpose. The serial port class was removed because it had no license. The build still registers it:
+
+<CodeRef path="Kick/modules/3rdParty/CMakeLists.txt" line={5} expect="juce_serialport">
+
+```cmake
+juce_serialport
+```
+
+</CodeRef>
+
+And the `Kick` README confirms the removal:
+
+<CodeRef path="Kick/README.md" line={29} expect="juce_serialport">
+
+```md
+- `modules/3rdParty/juce_serialport`, which has no license.
+```
+
+</CodeRef>
+
+The folder `Kick/modules/3rdParty/` has no `juce_serialport` in it. Anything that includes it, like the module that reads the control surface, cannot compile until you supply a replacement.
+
+### A build step that points at nowhere
+
+`Kick/3rdParty.cmake` sets the base URL for the two "private platform repositories" to a placeholder:
+
+<CodeRef path="Kick/3rdParty.cmake" line={8} expect="https://example.com/your-git-server">
+
+```cmake
+set(MT_PLATFORM_GIT_PATH   "https://example.com/your-git-server" CACHE STRING "Base URL for private platform repositories")
+```
+
+</CodeRef>
+
+Then it tries to download AudIO from that URL:
+
+<CodeRef path="Kick/3rdParty.cmake" line={86} expect="GIT_REPOSITORY ${MT_PLATFORM_GIT_PATH}/AudIO">
+
+```cmake
+GIT_REPOSITORY ${MT_PLATFORM_GIT_PATH}/AudIO
+```
+
+</CodeRef>
+
+And it does the same for the protocol library:
+
+<CodeRef path="Kick/3rdParty.cmake" line={102} expect="GIT_REPOSITORY ${MT_PLATFORM_GIT_PATH}/ComProtocol">
+
+```cmake
+GIT_REPOSITORY ${MT_PLATFORM_GIT_PATH}/ComProtocol
+```
+
+</CodeRef>
+
+The `AudIO/` and `ComProtocol/` folders in the repo are the public copies. The CMake file does not use them. It fetches by URL, so the repo does not build as shipped. The upstream README says so itself:
+
+<CodeRef path="Kick/README.md" line={12} expect="The build will not work out of the box:">
+
+```md
+The build will not work out of the box:
+```
+
+</CodeRef>
+
+The same README names the first reason:
+
+<CodeRef path="Kick/README.md" line={14} expect="Private dependencies are not included.">
+
+```md
+- **Private dependencies are not included.** `3rdParty.cmake` fetches two internal libraries,
+```
+
+</CodeRef>
+
+<Aside type="note" title="What I did not check">
+I did not try a build. The statements above come from reading the files. I also can't say whether pointing `MT_PLATFORM_GIT_PATH` at a mirror of the public `AudIO/` and `ComProtocol/` folders would be enough. The CMake file includes a `juce_modules.cmake` from the fetched AudIO folder, and the public `AudIO/` has none.
+</Aside>
+
+### Smaller gaps
+
+The READMEs list more removals: factory samples, the Myriad Pro font, the prebuilt cross-compile SDK, and the General MIDI SoundFont. Those are named in `Kick/README.md`, `AudIO/README.md` and `Linux/README.md`. The code still refers to them by path, so a missing-file error at runtime is expected, not a bug in your setup.
+
+## How to read this course
+
+Each lesson follows one shape: a hook, a plain-language model with an analogy, the real mechanism with `file:line` references, a diagram, the reason it is built that way, a lab where it makes sense, a five-question check, and a glossary.
+
+Code shows up in boxes like the ones above. The link at the top of each box goes to the pinned commit on GitHub, and the file name and line are the citation. A script checks every one of them against the repo, so a line number can't quietly drift.
+
+You will also see this badge on most boxes:
+
+<span class="not-verified">Not verified on hardware</span>
+
+It means I read the code but have not run it on a real KICK. The hardware is not out yet, so almost everything starts there. When I get a unit and confirm a claim, the badge goes away for that box. When something comes from outside this repository, such as an NXP datasheet or general knowledge of JUCE or Linux, I say so in the sentence.
+
+Two limits to keep in mind. I do not cover the software update path in this module. And the code is licensed AGPL-3.0-or-later for the Music Tribe parts, so any excerpt I show stays under that license. This course is unofficial and is not endorsed by Music Tribe.
+
+## Try it yourself
+
+Clone the upstream repository at the commit this course uses and look around:
+
+```bash
+git clone https://github.com/MusicTribeOpenSource/0700-AAM.git
+cd 0700-AAM
+git checkout 27194180ce5fbab3776ebce53e2d4b016597364e
+
+ls
+ls Kick Kick/apps Kick/modules
+ls AudIO ComProtocol Linux
+
+grep -n "MT_PLATFORM_GIT_PATH" Kick/3rdParty.cmake
+grep -rn "AudIO_juce" Kick/modules | head
+ls Kick/modules/3rdParty
+find . -name "juce_serialport*" -o -name "AudIO_juce*" -o -name "juce_modules.cmake"
+grep -rniE "camera|v4l2" Kick | head
+```
+
+Three things to write down. The last `find` should print nothing. The `ls` of `Kick/modules/3rdParty` should not show `juce_serialport`. And the camera search should come back empty. If any of those surprise you, check which commit you are on with `git log -1`.
+
+## Check yourself
+
+<Quiz
+  items={[
+    {
+      q: 'What does the KICK software run on?',
+      options: [
+        'A bare-metal program with no operating system',
+        'A Buildroot Linux image, with a JUCE C++ application on top',
+        'Android',
+        'A real-time operating system for microcontrollers',
+      ],
+      answer: 1,
+      why: 'The Linux folder is a Buildroot tree for the image, and the application is written in C++ with JUCE. Both READMEs say so.',
+    },
+    {
+      q: 'Which folder holds the packet protocol used to talk to the control surface?',
+      options: ['Kick/', 'AudIO/', 'ComProtocol/', 'Linux/'],
+      answer: 2,
+      why: 'ComProtocol/PktMgr defines the framed packets. AudIO is the audio engine and Linux is the OS build.',
+    },
+    {
+      q: 'Why does the repo not build as shipped?',
+      options: [
+        'The code is encrypted',
+        'JUCE 7 is not supported',
+        'The CMake file fetches AudIO and ComProtocol from a placeholder URL, and some modules the code needs are missing',
+        'It only builds on Windows',
+      ],
+      answer: 2,
+      why: 'Kick/3rdParty.cmake points at example.com, and modules such as juce_serialport, AudIO_juce and AudIO_constants have no folder in the tree.',
+    },
+    {
+      q: 'What can you say for certain about the camera and gesture feature from this repository alone?',
+      options: [
+        'It runs a hand-tracking model in the KICK app',
+        'The kernel config enables an OV5640 sensor driver, but no app code for it is in the repo',
+        'It is controlled by the AudIO library',
+        'It is disabled in the kernel',
+      ],
+      answer: 1,
+      why: 'Linux-defconfig line 373 turns the driver on. A search of Kick, AudIO and ComProtocol found no app code for it.',
+    },
+    {
+      q: 'What does the "Not verified on hardware" badge on a code box mean?',
+      options: [
+        'The line number is wrong',
+        'I read the code but have not confirmed the behavior on a real KICK',
+        'The code is deprecated',
+        'The file was removed upstream',
+      ],
+      answer: 1,
+      why: 'Line numbers are checked by script. The badge is about behavior on real hardware, which does not exist yet for this course.',
+    },
+  ]}
+/>
+
+## Words to know
+
+| Term | Meaning |
+|---|---|
+| KICK | The Behringer sampler and sequencer. The repo calls it BE 0700-AAM |
+| JUCE | A C++ framework for audio apps and plugins. It also draws the UI |
+| Buildroot | A tool that builds a small custom Linux system from a config file |
+| systemd | The first program Linux starts. It launches the other services |
+| Module (JUCE) | A folder with a header that declares its name and dependencies |
+| CMake | A build system. It reads `CMakeLists.txt` files and generates the real build |
+| CPM | A CMake helper that downloads dependencies from git when you configure |
+| MCU | Microcontroller: a small chip with its own program. Here, the control surface |
+| AGPL-3.0-or-later | The license on the Music Tribe code. It requires sharing source of changes, even for network use |
+| Pinned commit | One exact version of the repo, named by its SHA. Every citation points at it |
+
+Next: [Module 1, The hardware map](/kick-firmware-course/course/01-hardware-map/).

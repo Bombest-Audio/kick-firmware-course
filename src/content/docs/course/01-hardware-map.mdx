@@ -1,0 +1,262 @@
+---
+title: '1. The hardware map'
+description: What is inside a KICK, how the app talks to each part, and where to find every link in the source.
+---
+
+import { Image } from 'astro:assets';
+import { Aside } from '@astrojs/starlight/components';
+import CodeRef from '../../../components/CodeRef.astro';
+import Quiz from '../../../components/Quiz.astro';
+import hero from '../../../assets/heroes/m01-hardware-map.png';
+
+<Image src={hero} alt="Two dark circuit-board slabs, one small and one large, joined by a single glowing coral ribbon cable." />
+
+**Module 1 of 12 &#183; about 20 minutes &#183; no prerequisites**
+
+A KICK looks like one instrument. Inside, it is two computers sharing a box, and they talk over one wire. The big one runs Linux and the KICK app. The small one reads the pads, knobs and buttons and lights the LEDs. Almost every feature you can think of crosses that wire, so it is the first thing to understand.
+
+By the end of this module you will be able to name every chip or port the app talks to, say which kind of connection it uses, and find the line of code that opens it.
+
+## The map
+
+Here is the whole machine as the source code sees it. Each row says how the app reaches a part and where that happens in the repository.
+
+| Part | How the app reaches it | Where to look |
+|---|---|---|
+| Pads, buttons, knobs, LEDs | UART `/dev/ttymxc0`, 230400 baud | `input_events.cpp:46` |
+| DIN MIDI jacks | UART `/dev/ttymxc2`, bridged to ALSA by `ttymidi` | `ttymidi.c:485` |
+| CV/Gate jacks | I2C `/dev/i2c-3`, address `0x0c` | `kick_I2c.cpp:34` |
+| Touchscreen | Goodix GT911 chip on I2C, found through the device tree | `001.imx8mm_dtsi.patch:221` |
+| Audio in and out | ALSA card 0, 48 kHz, 32-bit samples | `asound.conf:27` |
+| Real-time clock | NXP PCF85263 chip, found through the device tree | `001.imx8mm_dtsi.patch:245` |
+| USB | Device mode through `/dev/usb-utp0/ep0`, serial gadget `/dev/ttyGS0` | `kick_UsbFunctionFS.cpp:76` |
+| USB-A drives | Mounted at `/mnt/flash` | `kick_Hwcommon.h:27` |
+| Camera | Linux driver present, no app code | `Linux-defconfig:373` |
+
+<figure class="kd">
+  <div class="kd-row">
+    <div class="kd-node layer-hardware"><b>Control surface MCU</b>pads, knobs, LEDs</div>
+    <div class="kd-wire"><span>UART</span></div>
+    <div class="kd-node layer-userspace"><b>Main computer</b>Linux and the KICK app</div>
+    <div class="kd-wire"><span>I2C</span></div>
+    <div class="kd-node layer-hardware"><b>CV DAC</b>CV/Gate jacks</div>
+  </div>
+  <div class="kd-legend"><span><i></i>data</span><span><i class="control"></i>control</span><span><i class="clock"></i>clock</span></div>
+  <figcaption>The two links that matter most. Everything else hangs off the main computer too.</figcaption>
+</figure>
+
+<Aside type="note" title="Analogy">
+Think of a band with a conductor and a stage crew. The main computer is the conductor: it knows the song, the tempo and what sound to make. The control surface MCU is the stage crew: it watches the floor, reports every footstep, and flips the lights when told. They never share a brain. They only pass short notes back and forth.
+</Aside>
+
+## Two ways chips talk
+
+Almost every row in that table uses one of two kinds of wire. Knowing the difference explains a lot of the code.
+
+### UART: one conversation, agreed speed
+
+A UART is a two-wire serial link. One wire carries bytes each way, and there is no shared clock. Instead, both sides agree ahead of time on a speed, called the baud rate, and each byte is wrapped in a start bit and a stop bit so the receiver can find the edges.
+
+The app opens the control-surface link like this:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={61} expect="SerialPortConfig config( 230400, 8,">
+
+```cpp
+SerialPortConfig config( 230400, 8, SerialPortConfig::SERIALPORT_PARITY_NONE,
+                         SerialPortConfig::STOPBITS_1, SerialPortConfig::FLOWCONTROL_NONE );
+```
+
+</CodeRef>
+
+Read it as "230400 bits per second, 8 data bits, no parity, 1 stop bit." That setup is called 8N1. Each byte costs 8 data bits plus a start and a stop bit, so 10 bits on the wire. At 230400 bits per second that is 23,040 bytes per second, about 23 kilobytes. That is plenty for button presses and LED colors, and far too small for audio. This is why the audio never travels over this link.
+
+### I2C: a shared hallway with addresses
+
+I2C is a two-wire bus that many chips share. Every chip has an address, like an apartment number, and the main computer says "number 12, here is your data." The CV/Gate chip answers to address `0x0c`:
+
+<CodeRef path="Kick/modules/hardware/source/kick_I2c.cpp" line={34} expect="/dev/i2c-3">
+
+```cpp
+: devicePath_( "/dev/i2c-3" ), address_( 0xc ), file_( -1 ), isDeviceOpen_( false )
+```
+
+</CodeRef>
+
+To set a voltage, the app sends three bytes. The first byte holds the command and the channel, and the other two hold a 12-bit value split across them:
+
+<CodeRef path="Kick/modules/hardware/source/kick_I2c.cpp" line={140} expect="buffer[0] = ( 0x30 | ( toChannelmap( channel ) ) );">
+
+```cpp
+buffer[0] = ( 0x30 | ( toChannelmap( channel ) ) );
+buffer[1] = ( regValue >> 4 ) & 0xFF;
+buffer[2] = ( regValue << 4 ) & 0xF0;
+```
+
+</CodeRef>
+
+Work one through. A 12-bit value runs from 0 to 4095, so the middle is 2048, which is `0x800` in hex. The top 8 bits are `0x80` and the bottom 4 bits are `0x0`. For channel 0 the three bytes are `30 80 00`. For `0x0ABC` they would be `30 AB C0`. The low nibble of the last byte is unused padding, which is why the code shifts left by 4.
+
+I am not naming the chip. The code never says which DAC it is, and guessing the part number would be a mistake. If you plan to change this protocol, get the schematic first.
+
+## The wire between the two computers
+
+The control surface link is the busiest connection in the machine, so it has its own small language. The `PktMgr` code defines eight kinds of packet:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.hpp" line={34} expect="enum enumPacketType">
+
+```cpp
+enum enumPacketType
+{
+    EN_PKT_TYPE_SYSTEM = 0,
+    EN_PKT_TYPE_BUTTON,
+    EN_PKT_TYPE_LED,
+    EN_PKT_TYPE_PAD,
+    EN_PKT_TYPE_KNOBS,
+    EN_PKT_TYPE_MIDI,
+    EN_PKT_TYPE_CV,
+    EN_PKT_TYPE_SLIDER,
+};
+```
+
+</CodeRef>
+
+That list is a good summary of what the control surface does: it reports pads, buttons, knobs and a slider, it accepts LED commands, and it carries MIDI and CV traffic of its own. A packet is a short frame that starts with the two letters `M` and `T`, so the receiver can find the start of a message even if it joins the conversation halfway through:
+
+<figure class="kd">
+  <div class="kd-pkt">
+    <div class="kd-byte layer-hardware"><small>start</small>M</div>
+    <div class="kd-byte layer-hardware"><small>start</small>T</div>
+    <div class="kd-byte layer-userspace"><small>type</small>&nbsp;</div>
+    <div class="kd-byte layer-userspace"><small>direction</small>&nbsp;</div>
+    <div class="kd-byte layer-userspace"><small>command</small>&nbsp;</div>
+    <div class="kd-byte layer-message"><small>size</small>&nbsp;</div>
+    <div class="kd-byte layer-kernel"><small>data</small>...</div>
+    <div class="kd-byte layer-bootloader"><small>crc</small>&nbsp;</div>
+  </div>
+  <figcaption>Packet order, taken from the receiver's state machine. Module 5 walks through it.</figcaption>
+</figure>
+
+The receiver checks for `M`, then `T`, then reads the type, direction, command and size, then the data bytes and the checksum. The size byte counts the data bytes plus one for the checksum, as Module 5 shows:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={44} expect="if( f_ui8Data == 'M' )">
+
+```cpp
+case EN_FRM_STATE_INIT_1:
+    if( f_ui8Data == 'M' )
+        m_enFrmState = EN_FRM_STATE_INIT_2;
+```
+
+</CodeRef>
+
+The checksum, called a CRC, lets the receiver throw away a packet that got scrambled on the way. You will meet it again in Module 5.
+
+## Who runs the other computer?
+
+The small computer has its own program, and that program is not in this repository. I know it exists for two reasons. The app's update code can send a new program to it over the same wire:
+
+<CodeRef path="Kick/modules/hardware/source/kick_FirmwareUpdate.cpp" line={112} expect="getSurfaceVersion">
+
+```cpp
+bool mcuFwStatus = ( isMCUImagePresent() && mt::HwPref::getHwPref().getSurfaceVersion().isNotEmpty() );
+```
+
+</CodeRef>
+
+And the packet code stops at the wire: there is a state machine for receiving, but nothing that says what happens inside the chip on the other end. Treat the control surface MCU as a black box with a known protocol. That is enough to write a replacement for the main computer's side, and it is the reason a custom OS is realistic even without that firmware.
+
+## What is not here
+
+- **The control surface firmware.** Only the main computer's side of the link is public.
+- **Camera and gesture code.** The Linux build includes a driver for an OV5640 camera sensor (`Linux-defconfig:373`), but I found no app code, model or inference library in the repository. The feature exists on the box and in marketing. The software that makes it work is not in this release.
+
+A note on the main chip. The board directory is named `imx8mm_var_som`, and the bootloader script checks for the i.MX 8M Mini platform (`imx8-bootloader-prepare.sh:11`). From NXP's public datasheet, not from this repository, that chip has no dedicated neural processor, so any on-device gesture recognition would run on the regular CPU cores unless the camera module has its own hardware. I have not seen a unit, so I can't say which.
+
+## Try it yourself
+
+You do not need hardware to build this map yourself. Clone the upstream repository at the commit this course uses and search for each device:
+
+```bash
+git clone https://github.com/MusicTribeOpenSource/0700-AAM.git
+cd 0700-AAM
+git checkout 27194180ce5fbab3776ebce53e2d4b016597364e
+
+grep -rn "ttymxc" Kick Linux/buildroot/board
+grep -rn "/dev/i2c" Kick
+grep -rn "EN_PKT_TYPE_" ComProtocol Kick/modules | head -30
+```
+
+Pick one packet type, such as `EN_PKT_TYPE_LED`, and follow it. Where is it sent? Where is it received? Write down the file and line for each. You will use that note in Module 5.
+
+## Check yourself
+
+<Quiz
+  items={[
+    {
+      q: 'Why does audio not travel over the UART link to the control surface?',
+      options: [
+        'The UART only supports MIDI',
+        'At 230400 baud it carries about 23 kilobytes per second, far too little for audio',
+        'The UART is encrypted',
+        'Audio uses the camera link',
+      ],
+      answer: 1,
+      why: 'Each byte takes 10 bits on the wire with an 8N1 setup, so 230400 bits per second is 23,040 bytes per second. Audio goes through ALSA to a codec instead.',
+    },
+    {
+      q: 'The CV DAC takes a 12-bit value of 0x0ABC on channel 0. Which three bytes does the app send?',
+      options: ['30 0A BC', '30 AB C0', '00 AB C0', '30 BC 0A'],
+      answer: 1,
+      why: 'The first byte is 0x30 OR the channel. The second is the value shifted right by 4 (0xAB). The third is the value shifted left by 4, masked to the top nibble (0xC0).',
+    },
+    {
+      q: 'What is the job of the letters M and T at the start of a packet?',
+      options: [
+        'They name the packet type',
+        'They let the receiver find the start of a frame',
+        'They hold the checksum',
+        'They set the baud rate',
+      ],
+      answer: 1,
+      why: 'The receiver waits for M, then T, before it starts reading the type, direction, command and size fields.',
+    },
+    {
+      q: 'What can you say for certain about the camera feature from this repository alone?',
+      options: [
+        'It runs a hand-tracking model on the GPU',
+        'The Linux build includes a driver for an OV5640 sensor, but no app code for it',
+        'It is controlled by the MCU over the PktMgr link',
+        'It is disabled in the kernel',
+      ],
+      answer: 1,
+      why: 'The kernel config enables the OV5640 driver. A search of the app, audio engine and protocol code found no camera or model code.',
+    },
+    {
+      q: 'Why is writing a custom OS still realistic without the control surface firmware?',
+      options: [
+        'The firmware is easy to replace',
+        'The wire protocol is public, so the main computer can speak it without knowing the MCU internals',
+        'The MCU is not needed',
+        'The firmware is bundled in the Linux image',
+      ],
+      answer: 1,
+      why: 'PktMgr defines the frame format and packet types for the main computer side. The MCU can stay a black box as long as you send and receive the same packets.',
+    },
+  ]}
+/>
+
+## Words to know
+
+| Term | Meaning |
+|---|---|
+| SoC | System on a chip: CPU, memory controller and many peripherals in one package |
+| MCU | Microcontroller: a small chip with its own program, often used to watch buttons and sensors |
+| UART | Two-wire serial link with an agreed speed and no shared clock |
+| Baud | Signal changes per second. Here it is the same as bits per second |
+| I2C | Two-wire shared bus where each chip has an address |
+| DAC | Digital to analog converter. Turns a number into a voltage |
+| ALSA | The Linux sound system |
+| Device node | A file in `/dev` that stands for a piece of hardware, like `/dev/i2c-3` |
+| Device tree | A data file that tells the Linux kernel what hardware exists and at which addresses |
+| CRC | A checksum that detects scrambled data |
+
+Next: [Module 2, Boot](/kick-firmware-course/course/02-boot/).

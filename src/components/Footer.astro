@@ -1,0 +1,19 @@
+---
+import Default from '@astrojs/starlight/components/Footer.astro';
+---
+
+<Default {...Astro.props}><slot /></Default>
+<p class="disclaimer">
+	Unofficial community course. Not made by or endorsed by MUSIC Tribe. Behringer and KICK are
+	trademarks of MUSIC Tribe. Course text and images are CC BY-SA 4.0. Quoted code stays under its
+	original license (AGPL-3.0-or-later for the Music Tribe code).
+</p>
+
+<style>
+	.disclaimer {
+		margin-top: 1.5rem;
+		font-family: var(--font-mono);
+		font-size: var(--fs-xs);
+		color: var(--muted);
+	}
+</style>

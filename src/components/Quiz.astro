@@ -1,0 +1,32 @@
+---
+interface Item {
+	q: string;
+	options: string[];
+	answer: number;
+	why: string;
+}
+interface Props {
+	items: Item[];
+}
+const { items } = Astro.props;
+const letters = ['A', 'B', 'C', 'D'];
+---
+
+<div class="quiz">
+	{
+		items.map((item, n) => (
+			<div class="quiz-item">
+				<p class="quiz-q"><span class="quiz-n">{n + 1}</span> {item.q}</p>
+				<ul class="quiz-opts">
+					{item.options.map((o, i) => (
+						<li><span class="quiz-l">{letters[i]}</span> {o}</li>
+					))}
+				</ul>
+				<details>
+					<summary>Show answer</summary>
+					<p><strong>{letters[item.answer]}.</strong> {item.why}</p>
+				</details>
+			</div>
+		))
+	}
+</div>

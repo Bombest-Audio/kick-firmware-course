@@ -1,0 +1,23 @@
+---
+import { permalink } from '../lib/upstream';
+
+interface Props {
+	path: string;
+	line: number;
+	/** Text that must appear on that line. Checked by scripts/check-citations.mjs. */
+	expect: string;
+	/** Set true only once the claim has been confirmed on a real unit. */
+	verified?: boolean;
+}
+
+const { path, line, expect, verified = false } = Astro.props;
+const short = path.split('/').slice(-1)[0];
+---
+
+<div class="coderef">
+	<div class="coderef-head">
+		<a class="coderef-file" href={permalink(path, line)} title={path} data-expect={expect}>{short}:{line}</a>
+		{!verified && <span class="not-verified">Not verified on hardware</span>}
+	</div>
+	<div class="coderef-body"><slot /></div>
+</div>

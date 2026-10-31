@@ -1,0 +1,1230 @@
+---
+title: '8. Time: sequencer, transport and clocks'
+description: What a clock tick is, how the KICK counts 96 of them per quarter note, which threads carry a tick from the timer to a playing voice, what play, stop, loop and song mode do, and what the box does and does not do with MIDI clock and CV gate.
+---
+
+import { Image } from 'astro:assets';
+import { Aside } from '@astrojs/starlight/components';
+import CodeRef from '../../../components/CodeRef.astro';
+import Quiz from '../../../components/Quiz.astro';
+import hero from '../../../assets/heroes/m08-time.png';
+
+<Image src={hero} alt="A glowing violet pulse train ticks along a thin rail, with a few taller accented beats standing out from the rest." />
+
+**Module 8 of 12 &#183; about 45 minutes &#183; needs Module 7**
+
+A drum machine is a clock with a sound library attached. The sounds are Module 7. The clock is this lesson. If the clock is a few milliseconds late, every hit is late. If the clock cannot listen to another machine, the box plays alone.
+
+You might expect the sequencer to live inside the audio callback, where timing is best. It does not. I will show you which threads it uses, what that costs, and what a custom OS could do about it.
+
+By the end you will be able to do five things. Turn a tempo and a PPQN into a tick period with arithmetic. Name the three threads between the timer and a playing voice. Describe what play, stop, loop and song mode do. Say exactly what the box does with incoming MIDI clock, start and stop. And sketch the design for external sync, labeled as a sketch.
+
+<Aside type="note" title="Analogy">
+A conductor in front of a row of drummers. The conductor does not play. The conductor only counts, and splits each beat into 96 tiny beats. Each drummer has a page of notes and plays whichever note sits on the current tiny beat. If the conductor counts a little late, the whole band is late together. If a drummer is told "play now" by a messenger who runs across the room, the hit lands when the messenger arrives, not when the conductor counted.
+</Aside>
+
+<Aside type="caution" title="What I could check">
+I read the source at one pinned commit. I did not build the firmware or run it on a unit, so every code badge below says "Not verified on hardware". Where I say what a line does, that is my reading.
+
+Two things in this lesson did run, on my laptop, and I say so where they appear. Both are small C++ programs that copy the arithmetic of the clock code with a perfect 1 millisecond timer. They show what the formulas do. They do not show what a real Linux scheduler does.
+
+The public `AudIO` folder is partial. The `AudIO_juce` and `AudIO_constants` modules are missing, so constants such as `AUDIO_BLOCK_SIZE` are used but never defined. Module 6 covers that gap. It limits what I can cite about the audio block here.
+</Aside>
+
+## What a clock is
+
+A sequencer needs to know "where am I in the song". It cannot ask in seconds, because tempo changes what a second means. It counts in **ticks**, small equal slices of a quarter note. The number of slices is the **PPQN**, pulses per quarter note.
+
+The arithmetic is two lines:
+
+```text
+ticks per second = (BPM / 60) x PPQN
+tick period      = 1 / (ticks per second)
+```
+
+At 120 BPM the song moves 2 quarter notes per second. With 24 PPQN that is 48 ticks per second, so one tick lasts 20.833 ms. With 96 PPQN it is 192 ticks per second, so one tick lasts 5.208 ms. More PPQN means finer placement of a note.
+
+MIDI's own clock is fixed at 24 PPQN (general MIDI knowledge, not from this repository). It is a coarse beat that machines send each other. The sequencer inside the KICK counts finer than that.
+
+### The app's real PPQN
+
+The clock class has two PPQN settings, one for its own counting and one for a clock arriving from outside. The defaults are 96 and 24:
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.h" line={138} expect="intPPQN = PPQN_96">
+
+```cpp
+PPQNResolution intPPQN = PPQN_96;
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.h" line={139} expect="extPPQN = PPQN_24">
+
+```cpp
+PPQNResolution extPPQN = PPQN_24;
+```
+
+</CodeRef>
+
+The tempo and time math elsewhere in the engine uses a constant, `defaultPPQN`, which is also 96:
+
+<CodeRef path="AudIO/AudIO/Daw/DawTime.h" line={158} expect="defaultPPQN = 96">
+
+```cpp
+static constexpr int defaultPPQN = 96;
+```
+
+</CodeRef>
+
+I searched the checkout for any call to `setInternalPPQN` or `setExternalPPQN` outside the clock class. There is none. So in the code I have, the sequencer counts 96 ticks per quarter note and nothing changes that. Even the MIDI file code inside a track is told to use it:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp" line={185} expect="setTicksPerQuarterNote( defaultPPQN )">
+
+```cpp
+mFile.setTicksPerQuarterNote( defaultPPQN );
+```
+
+</CodeRef>
+
+The allowed tempo range is 20 to 300 BPM:
+
+<CodeRef path="AudIO/AudIO/Daw/DawTime.h" line={83} expect="= 20.0">
+
+```cpp
+static constexpr double minTempo     = 20.0;
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Daw/DawTime.h" line={85} expect="= 300.0">
+
+```cpp
+static constexpr double maxTempo     = 300.0;
+```
+
+</CodeRef>
+
+Here is what 96 PPQN costs and buys at three tempos. The last column assumes the 48 kHz sample rate from Module 6:
+
+| BPM | Quarter note | Tick period | Audio frames per tick at 48 kHz |
+|---|---|---|---|
+| 60 | 1000 ms | 10.417 ms | 500 |
+| 120 | 500 ms | 5.208 ms | 250 |
+| 240 | 250 ms | 2.604 ms | 125 |
+
+At 120 BPM and 96 PPQN, one tick is exactly 250 frames of audio. Keep that number. It comes back when I talk about sample accuracy.
+
+### Time signatures change the beat, not the tick
+
+The tick stays one 96th of a quarter note. What changes is how many ticks make a beat and a bar. The formula divides four quarter notes by the time signature's bottom number:
+
+<CodeRef path="AudIO/AudIO/Daw/DawTime.h" line={66} expect="(double)ppq * 4.0">
+
+```cpp
+constexpr double ticksPerBeat( int denominator, int ppq ) noexcept { return ( ( (double)ppq * 4.0 ) / (double)denominator ); }
+```
+
+</CodeRef>
+
+The engine's tempo settings call it with `defaultPPQN`:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_transport.cpp" line={94} expect="ticksPerBeat( getDenominator(), defaultPPQN )">
+
+```cpp
+return AudIO::ticksPerBeat( getDenominator(), defaultPPQN );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_transport.cpp" line={99} expect="ticksPerBar( getNumerator(), getDenominator(), defaultPPQN )">
+
+```cpp
+return AudIO::ticksPerBar( getNumerator(), getDenominator(), defaultPPQN );
+```
+
+</CodeRef>
+
+Work it out. In 4/4 a beat is 96 x 4 / 4 = 96 ticks and a bar is 4 x 96 = 384 ticks. In 6/8 a beat is 96 x 4 / 8 = 48 ticks and a bar is 6 x 48 = 288 ticks. At 120 BPM, 288 ticks of 5.208 ms is 1.5 seconds, which is what six eighth notes take.
+
+## The clock itself: `CMidiClock`
+
+The class is named `CMidiClock`, and the name misleads. It is not a clock that sends or receives MIDI. It is the sequencer's internal tick generator. I found no place where it builds a MIDI message. The name only reflects that it counts in MIDI-style ticks.
+
+There is one of it, shared by everything:
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.cpp" line={36} expect="gMidiClock">
+
+```cpp
+static CMidiClock gMidiClock{};
+```
+
+</CodeRef>
+
+It inherits from JUCE's high-resolution timer:
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.h" line={44} expect="juce::HighResolutionTimer">
+
+```cpp
+class CMidiClock : private juce::HighResolutionTimer
+```
+
+</CodeRef>
+
+JUCE's `HighResolutionTimer` runs its callback on a thread of its own, not on the message thread and not on the audio callback (general JUCE knowledge, the JUCE source is not in this repository). I did not check what scheduling priority JUCE gives that thread.
+
+### One millisecond, and a counter that adds up elapsed time
+
+When the clock starts, it asks that timer for a callback every 1 ms:
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.cpp" line={59} expect="startTimer( 1 )">
+
+```cpp
+getMidiClock().startTimer( 1 );
+```
+
+</CodeRef>
+
+1 ms is finer than a 5.208 ms tick. The timer fires about five times per tick at 120 BPM. The clock does not turn each firing into a tick. It measures elapsed time instead. First, the tempo becomes microseconds per quarter note:
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.h" line={110} expect="MICROS_IN_MINUTE / Tempo">
+
+```cpp
+static float tempoToMicros( float Tempo ) noexcept { return ( MICROS_IN_MINUTE / Tempo ); }
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.cpp" line={161} expect="tempoToMicros( Bpm )">
+
+```cpp
+microsPerQuarterNote = tempoToMicros( Bpm ); // In Micro-Seconds.
+```
+
+</CodeRef>
+
+At 120 BPM that is 60,000,000 / 120 = 500,000 microseconds. Then it computes how many ticks fit in one millisecond:
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.cpp" line={66} expect="getMidiClock().getInternalPPQN()">
+
+```cpp
+sTickFactor    = ( (float)( mills * 1000 ) / (float)microSeconds ) * getMidiClock().getInternalPPQN();
+```
+
+</CodeRef>
+
+`mills` is 1, so the factor is (1000 / 500,000) x 96 = 0.192 ticks per millisecond. That matches the 192 ticks per second I computed above.
+
+On every timer callback the clock reads the wall time, multiplies the elapsed milliseconds by that factor, and quits early if less than one whole tick has passed:
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.cpp" line={232} expect="getMillisecondCounterHiRes">
+
+```cpp
+auto currTime  = juce::Time::getMillisecondCounterHiRes();
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.cpp" line={234} expect="sTickFactor * diffTime">
+
+```cpp
+auto diffTicks = ( sTickFactor * diffTime );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.cpp" line={236} expect="diffTicks < 1.0">
+
+```cpp
+if( diffTicks < 1.0 )
+```
+
+</CodeRef>
+
+Otherwise it adds the fractional tick count to a running total and reports the whole-number part:
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.cpp" line={241} expect="sTickCounter += diffTicks">
+
+```cpp
+sTickCounter += diffTicks;
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.cpp" line={282} expect="(uint32_t)sTickCounter">
+
+```cpp
+onTick( (uint32_t)sTickCounter );
+```
+
+</CodeRef>
+
+This is a sound way to avoid drift. The total is a real elapsed-time count, so a late callback does not lose time. The cost shows up in the next two paragraphs.
+
+### What that does to the tick stream
+
+I wrote a scratch C++ program on my laptop that repeats this arithmetic with a perfect 1 ms timer and 96 PPQN. It is not the firmware. It shows what the formulas do when the timer behaves.
+
+At 120 BPM the program gets a callback about every 6 ms, not every 5.208 ms. The reason: 5 ms of elapsed time is 0.96 ticks, which is under 1, so it waits one more millisecond and has 1.152 ticks. Over 10 simulated seconds there were 1,666 callbacks, and the counter ended at 1,919 when the ideal is 1,920. So no drift. But in 253 of those callbacks the whole-number tick value jumped by 2, and a tick value was never reported. Each reported tick also arrived up to about one tick (5.2 ms) after its ideal time. At 240 BPM the same effect doubled: 506 of 3,333 callbacks skipped a value.
+
+Two things follow. A downstream consumer must not assume it sees every tick value. And the clock itself adds timing error before any other thread touches the tick. The scratch results are about the formulas. A real timer adds its own lateness on top.
+
+## Three threads between a tick and a sound
+
+Module 6 said the sequencer "ticks on its own thread" and stopped there. Now I can say which. The timer thread does not play notes. It hands the tick to a second thread that the transport manager creates at startup:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={54} expect="{ onTick( T ); }">
+
+```cpp
+midiClock.onTick           = [&]( uint32_t T ) { onTick( T ); };
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={67} expect="new std::thread">
+
+```cpp
+tickProcessingThread    = new std::thread( tickProcessingFunc );
+```
+
+</CodeRef>
+
+I searched the app code (everything but third-party folders) for `setPriority`, `SCHED_` and `pthread_setschedparam`. There are no hits. So that thread has default scheduling, with no real-time priority that I can see in this source.
+
+The timer thread's `onTick` stores the tick number and wakes the worker:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={234} expect="curTick = Ticks">
+
+```cpp
+curTick = Ticks;
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={235} expect="onTickEvent.signal()">
+
+```cpp
+onTickEvent.signal();
+```
+
+</CodeRef>
+
+The worker waits on that event, at most 1 ms (JUCE's `WaitableEvent::wait` takes a timeout in milliseconds, general knowledge), and then runs the sequence:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={288} expect="onTickEvent.wait( 1 )">
+
+```cpp
+onTickEvent.wait( 1 );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={299} expect="onTick( curTick )">
+
+```cpp
+playingSequence->onTick( curTick );
+```
+
+</CodeRef>
+
+If the worker is still busy with the previous tick, the timer thread simply returns and does not queue another:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={231} expect="threadIsProcessingTick">
+
+```cpp
+if( threadIsProcessingTick )
+```
+
+</CodeRef>
+
+That is safe for notes, as the next section shows, because the tick number is a running total, not an event count.
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>Timer thread</b><br />Wakes every 1 ms. Turns elapsed time into a tick number.</div>
+    <div class="kd-step"><b>Tick thread</b><br />Woken by an event. Runs the sequence, tracks and programs.</div>
+    <div class="kd-step"><b>Voice state</b><br />The tick thread flips a voice from SETUP to RUNNING.</div>
+    <div class="kd-step"><b>Audio thread</b><span class="layer layer-audio">audio callback</span><br />At its next block, sees a RUNNING voice and renders it.</div>
+  </div>
+  <figcaption>The sequencer is not in the audio callback. Two threads sit between the clock and the audio thread, and the audio thread only finds out at its next block.</figcaption>
+</figure>
+
+Only the last box is the audio thread, so only it gets the violet chip. The timer thread and the tick thread have no color in the course palette, and neither is the message thread.
+
+## From tick to note-on: the whole path
+
+Here is the path, one hop at a time. This is also the lab target.
+
+**Hop 1, the sequence counts.** `MTSequence::onTick` turns the tick number into a difference from the last one it saw. That difference is what makes skipped tick values harmless:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_sequence.cpp" line={707} expect="Ticks - prevTicks">
+
+```cpp
+auto diff = Ticks - prevTicks;
+```
+
+</CodeRef>
+
+It advances its bar and beat counters by `diff`, then walks the tracks while holding a lock:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_sequence.cpp" line={738} expect="ScopedLock sl( lock )">
+
+```cpp
+const juce::ScopedLock sl( lock );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_sequence.cpp" line={740} expect="onTick( Ticks )">
+
+```cpp
+it->onTick( Ticks );
+```
+
+</CodeRef>
+
+That is a lock on the tick thread. The same lock name appears when a track is deleted, so an edit that takes it can make the tick thread wait:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_sequence.cpp" line={290} expect="ScopedLock sl( lock )">
+
+```cpp
+const juce::ScopedLock sl( lock );
+```
+
+</CodeRef>
+
+**Hop 2, the track looks at every tick in between.** This is the loop that makes the design correct even when the clock skips a value. The track visits each tick from the last one it processed, plus one, up to the current one:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp" line={289} expect="PrevTick + 1">
+
+```cpp
+for( auto pos = PrevTick + 1; pos <= tick; pos++ )
+```
+
+</CodeRef>
+
+For each tick position it looks up the notes that start there. A note passes a probability roll first:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp" line={301} expect="probability.get()">
+
+```cpp
+if( rand <= it->probability.get() )
+```
+
+</CodeRef>
+
+**Hop 3, the note-on is born.** Here a stored note becomes a MIDI note-on message in a list. This is the line the lab asks you to find:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp" line={306} expect="juce::MidiMessage::noteOn( MidiChannel, noteNo">
+
+```cpp
+midiMsgs.insert( -1, juce::MidiMessage::noteOn( MidiChannel, noteNo, (juce::uint8)noteVelocity ) );
+```
+
+</CodeRef>
+
+A ratchet splits one note into repeats. The code reads the repeat count, and later notes are queued with their own tick times:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp" line={309} expect="ratchet.get()">
+
+```cpp
+auto parts = (int)( it->ratchet.get() );
+```
+
+</CodeRef>
+
+The note-off is queued for the note's length minus one tick after its start:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp" line={323} expect="length.get() - 1">
+
+```cpp
+queuedNotes.insert( { ( pos + it->length.get() - 1 ), juce::MidiMessage::noteOff( MidiChannel, noteNo, (juce::uint8)noteVelocity ) } ); // Queue note-off
+```
+
+</CodeRef>
+
+**Hop 4, the list goes to the program.** When the walk is done, a non-empty list is handed to the track's program:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp" line={376} expect="noteProcess( midiMsgs )">
+
+```cpp
+pProgram->noteProcess( midiMsgs );
+```
+
+</CodeRef>
+
+This is the same `noteProcess` call that Module 7 followed from a pad press. The base class turns a note-on message into a call to the program's `noteOn`:
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_iprogram.cpp" line={282} expect="noteOn( noteNo, midiLevel )">
+
+```cpp
+noteOn( noteNo, midiLevel );
+```
+
+</CodeRef>
+
+**Hop 5, a voice starts.** In the drum program, a free voice is borrowed and started:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={128} expect="noteOn( Note, Velocity )">
+
+```cpp
+voice->noteOn( Note, Velocity );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={129} expect="addVoiceForPlayback( voice )">
+
+```cpp
+addVoiceForPlayback( voice );
+```
+
+</CodeRef>
+
+That call ends in one assignment:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={116} expect="makeRunning();">
+
+```cpp
+Voice->makeRunning();
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.h" line={40} expect="state = State::RUNNING">
+
+```cpp
+inline void makeRunning() { state = State::RUNNING; }
+```
+
+</CodeRef>
+
+The state is an atomic, as the reads show:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.h" line={35} expect="state.load()">
+
+```cpp
+inline bool isFree() { return State::FREE == state.load(); }
+```
+
+</CodeRef>
+
+Setting it does not tell the audio thread when inside the block to begin. It only makes the voice eligible. The audio thread finds it when its voice loop next runs:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={195} expect="process( bufferToFill )">
+
+```cpp
+it->process( bufferToFill );
+```
+
+</CodeRef>
+
+So a sequenced hit starts at the beginning of the next audio block after the tick thread flips the flag. Nothing in this path carries a sample offset into the block. That answers the sample-accuracy question for the stock code, as far as I read it: no.
+
+<Aside type="caution" title="Open question: Module 7">
+Module 7 said I had not traced which thread runs the note path. For a sequenced note I now can: the tick thread runs `fillMidiMessages`, `noteProcess` and `DrumProgram::noteOn`. For a pad press, the first hops run on the thread that handles the screen message, as Module 5 showed. Either way, the code that picks a layer and a voice allocates a few small vectors, which Module 6 says the audio thread must never do. The design keeps that code off the audio thread, which is a reason the sequencer is not in the callback.
+</Aside>
+
+## Transport: play, pause, stop, loop, song
+
+The **transport** is the part that decides whether time is moving. Its state is one of four values:
+
+<CodeRef path="Kick/modules/engine/interface/source/mt_audio_interface_types.h" line={185} expect="enum TransportState">
+
+```cpp
+enum TransportState
+```
+
+</CodeRef>
+
+The four are `Idle`, `Playing`, `Paused` and `Stopped`. The state is stored as a property of a `ValueTree`, so screens can listen to changes:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={112} expect="IDs::state">
+
+```cpp
+t.setProperty( IDs::state, TState, nullptr );
+```
+
+</CodeRef>
+
+**Play** picks a sequence. If the transport is paused it resumes, otherwise it plays from the sequence's start:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={148} expect="resume();">
+
+```cpp
+playingSequence->resume();
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={152} expect="play();">
+
+```cpp
+playingSequence->play();
+```
+
+</CodeRef>
+
+The sequence's `play` is where the clock starts, and it asks the clock to clear its counters:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_sequence.cpp" line={658} expect="getMidiClock().start( true )">
+
+```cpp
+getMidiClock().start( true );
+```
+
+</CodeRef>
+
+Resume starts the clock without clearing:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_sequence.cpp" line={669} expect="getMidiClock().start( false )">
+
+```cpp
+getMidiClock().start( false );
+```
+
+</CodeRef>
+
+**Pause and stop** both stop the clock first. Pause leaves the playheads alone. Stop clears the track playhead:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={169} expect="midiClock.stop()">
+
+```cpp
+midiClock.stop();
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={189} expect="stop();">
+
+```cpp
+playingSequence->stop();
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp" line={219} expect="trackPlayhead.clear()">
+
+```cpp
+trackPlayhead.clear();
+```
+
+</CodeRef>
+
+**Tempo** is read from the sequence at each bar boundary and pushed into the shared clock. A sequence can have a different BPM per bar:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_sequence.cpp" line={807} expect="setupMidiClock">
+
+```cpp
+setupMidiClock( sequencePlayhead.bnb.bar );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_sequence.cpp" line={828} expect="getMidiClock().setTempo( newTempo )">
+
+```cpp
+getMidiClock().setTempo( newTempo );
+```
+
+</CodeRef>
+
+**Loop** is handled when a bar ends. If the sequence is looping and the bar counter reaches the loop end, the sequence jumps back to the loop start:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_sequence.cpp" line={792} expect="isLooping.get() &&">
+
+```cpp
+if( isLooping.get() && ( sequencePlayhead.bnb.bar >= lEnd ) )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_sequence.cpp" line={801} expect="seekSeqenceInternal( getTicksUpto( loopStartBar ) )">
+
+```cpp
+seekSeqenceInternal( getTicksUpto( loopStartBar ) );
+```
+
+</CodeRef>
+
+I see no clock stop or start call in that branch, so the clock keeps counting through a loop. Only the sequence's own position jumps.
+
+**Play on the next bar.** Calling `play` with `Now` false stores the request in atomics. A later bar boundary acts on it:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={205} expect="_nextBar.isEnabled.store( true )">
+
+```cpp
+_nextBar.isEnabled.store( true );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={332} expect="_nextBar.fromBegin.load()">
+
+```cpp
+_nextBar.fromBegin.load() ? play( _nextBar.seq.load() ) : resume( _nextBar.seq.load() );
+```
+
+</CodeRef>
+
+**Song mode** is a queue of steps. `setupSong` pushes one entry per step, each with the time in ticks at which to switch to the next sequence:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={385} expect="data.timeInTicks">
+
+```cpp
+data.timeInTicks        = pSeq->getTicksPerBar() * ( repeat * length );
+```
+
+</CodeRef>
+
+A running counter, `playTime`, is advanced on every timer callback, and the front of the queue fires when the counter reaches its time:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={238} expect="playTime += ( curTick - prevTick )">
+
+```cpp
+playTime += ( curTick - prevTick );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={243} expect="timeInTicks <= playTime">
+
+```cpp
+if( playQueue.front().timeInTicks <= playTime )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={250} expect="play( playQueue.front().seq )">
+
+```cpp
+play( playQueue.front().seq );
+```
+
+</CodeRef>
+
+Note the `<=`. A comparison that asks "has the counter reached the time" survives a skipped tick value.
+
+<Aside type="caution" title="My reading, not run on hardware">
+Two lines in this file look fragile to me. I have not provoked either one.
+
+First, "next sequence" uses an equality test on the raw tick number:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={275} expect="curTick % lengthInTicks == 0">
+
+```cpp
+if( curTick % lengthInTicks == 0 )
+```
+
+</CodeRef>
+
+The scratch run above showed that the tick value can jump by 2 and skip a number. If the skipped number is the bar boundary, the test never sees zero on that bar. I extended my scratch program to count how many bar-boundary values (multiples of 384) the ideal 1 ms timer ever reports. At 90 BPM it was 223 of 224. At 120 BPM it was 273 of 300. At 150 BPM it was 80 of 374. Real timing noise would shuffle which values are skipped, so these are not predictions for a unit. But they say the equality test depends on luck, and more at faster tempos. A test with `>=` plus a "done" flag would not.
+
+Second, `playTime` is advanced on the timer thread from `prevTick`, and `prevTick` is written by the tick thread:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp" line={295} expect="prevTick.store( curTick )">
+
+```cpp
+prevTick.store( curTick );
+```
+
+</CodeRef>
+
+If the timer fires twice before the tick thread wakes, the difference could be counted twice. That would make song steps switch early. I read this. I did not make it happen.
+</Aside>
+
+## Swing and quantize
+
+Swing delays every second note of a pair to give a shuffle. Quantize snaps note times to a grid. I looked for both in the tick path above and in the engine.
+
+I found no swing in the engine. A swing slider exists on the "Timing Correct" dialog of the list editor, with a range of 50 to 75:
+
+<CodeRef path="Kick/modules/kick_ui/modes/kick_ListEdit.cpp" line={562} expect="swing.setRange( 50, 75, 1 )">
+
+```cpp
+swing.setRange( 50, 75, 1 );
+```
+
+</CodeRef>
+
+But its change handler is empty:
+
+<CodeRef path="Kick/modules/kick_ui/modes/kick_ListEdit.cpp" line={582} expect="swing.onValueChanged">
+
+```cpp
+swing.onValueChanged = [&]( int Value ) {};
+```
+
+</CodeRef>
+
+And the dialog is closed with a callback that only deletes the dialog object:
+
+<CodeRef path="Kick/modules/kick_ui/modes/kick_ListEdit.cpp" line={156} expect="delete pTc">
+
+```cpp
+delete pTc;
+```
+
+</CodeRef>
+
+So at this commit the swing control does nothing that I can find. The shift slider is the same:
+
+<CodeRef path="Kick/modules/kick_ui/modes/kick_ListEdit.cpp" line={584} expect="shiftTiming.onValueChanged">
+
+```cpp
+shiftTiming.onValueChanged = [&]( int Value ) {};
+```
+
+</CodeRef>
+
+The window and strength sliders follow it with empty handlers on the next two lines.
+
+Quantize is a grid setting used when notes are drawn and edited. The pencil tool asks the grid how many ticks one quantize step is:
+
+<CodeRef path="Kick/modules/kick_ui/audio_components/gridview/kick_GridPencilTool.cpp" line={79} expect="getTicksPerQuantization( bar )">
+
+```cpp
+auto ticksPerQl = gridData.getTicksPerQuantization( bar );
+```
+
+</CodeRef>
+
+I did not find a quantize step between the tick and the note-on, so I read it as edit-time only: notes are placed on the grid and played where they were placed. If you want swing during playback, you would add a tick offset in the track's note lookup. That is a change to `fillMidiMessages`, and I have not tried it.
+
+## Timing, jitter and why the audio thread matters
+
+Add up where a sequenced hit can lose time, from the code and the general mechanics:
+
+- **Clock granularity.** The timer reports in whole ticks, up to about one tick late in my scratch model. At 120 BPM that is up to 5.2 ms.
+- **Timer wake-up lateness.** A 1 ms timer on a general-purpose Linux system wakes when the scheduler lets it (general knowledge). I did not measure this.
+- **Event hand-off.** The tick thread wakes after the signal. How soon depends on the scheduler and, with no priority set, on whatever else is running.
+- **The lock.** If an edit holds the sequence lock, the tick thread waits.
+- **The block boundary.** The voice flips to RUNNING at some moment. The audio thread starts it at its next block. The block size is unknown, as Module 6 explained, but the engine caps it at 480 frames:
+
+<CodeRef path="AudIO/AudIO/Daw/DawEngine.cpp" line={22} expect="( 480 )">
+
+```cpp
+#define BLOCK_SIZE    ( 480 )
+```
+
+</CodeRef>
+
+At 48 kHz:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/asound.conf" line={28} expect="rate 48000">
+
+```text
+rate 48000
+```
+
+</CodeRef>
+
+a 480-frame block is 10 ms. If that were the real block, a hit could wait up to 10 ms for the block edge. I use 480 as an example, not as a measurement.
+
+The word **latency** is the average delay. The word **jitter** is how much that delay varies from hit to hit. Constant latency is usually fine, because you can compensate for it. Jitter is what makes a groove sound uneven. A hit that is 3 ms late, then 0 ms, then 5 ms, then 1 ms sounds sloppy even when the average is small. How small is small depends on the listener and the sound. People often quote a few milliseconds up to about 10 ms as where drummers start to hear timing wobble (general knowledge, not measured here).
+
+### Why the audio thread is the better place for timing
+
+The audio callback runs once per block, on a schedule the sound hardware sets. The audio hardware is the steadiest clock in the box: it consumes 48,000 frames per second against its own crystal (general knowledge, not measured here). If the sequencer counts in audio frames, its tempo is locked to that crystal, and a tick has a known frame position. At 120 BPM and 96 PPQN, tick N sits at frame N x 250. The sequencer can find every tick that falls inside the next block and give each note an offset in frames. A hit then lands on an exact frame, not at the next block edge plus scheduling noise.
+
+A wall-clock timer on another thread counts a different clock. The two clocks drift, and the timer's callbacks are disturbed by anything else the CPU is doing. Hand-offs between threads add delay, and they add it unevenly.
+
+The price of the audio-thread approach is the rule from Module 6: the sequencer would have to run with no locks, no allocation and no file or bus I/O. The note path in this code allocates vectors and, for CV, writes to an I2C bus. Moving it would mean rewriting those parts first. That is the design trade the stock code made. It kept the awkward work off the audio thread and accepted the timing error.
+
+## MIDI clock in, and the sync gap
+
+Other gear syncs by sending MIDI realtime messages (general MIDI knowledge): a clock byte, 24 times per quarter note, plus Start, Stop and Continue bytes. A DAW or a drum machine sends them. A machine that wants to follow counts the clocks, derives tempo from their spacing, and starts or stops on the other three.
+
+The KICK app receives MIDI messages and has branches for exactly those messages. They are empty:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={73} expect="msg.isMidiClock() ) {}">
+
+```cpp
+if( msg.isMidiClock() ) {}
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={74} expect="msg.isMidiStart() ) {}">
+
+```cpp
+else if( msg.isMidiStart() ) {}
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={75} expect="msg.isMidiStop() ) {}">
+
+```cpp
+else if( msg.isMidiStop() ) {}
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={76} expect="msg.isMidiContinue() ) {}">
+
+```cpp
+else if( msg.isMidiContinue() ) {}
+```
+
+</CodeRef>
+
+The same chain ends in two more empty branches for tempo and time-signature events that come from MIDI files. Everything else, which means notes and controllers, goes to every track of the selected sequence:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={84} expect="processIncomingMidiMessage( Msg )">
+
+```cpp
+T->processIncomingMidiMessage( Msg );
+```
+
+</CodeRef>
+
+So a clock, start, stop or continue message is caught by its branch and thrown away. It never reaches a track, the transport or the clock class.
+
+The messages also take a long road to be ignored. The device manager gets them on a MIDI thread, queues them, and asks the message thread to deliver them:
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/midi_device_manager.cpp" line={290} expect="This is called on the MIDI thread">
+
+```cpp
+// This is called on the MIDI thread
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/midi_device_manager.cpp" line={296} expect="triggerAsyncUpdate()">
+
+```cpp
+triggerAsyncUpdate();
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/midi_device_manager.cpp" line={301} expect="This is called on the message loop">
+
+```cpp
+// This is called on the message loop
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={90} expect="onMidiMessage = midiMesageHandler">
+
+```cpp
+MTMidiDeviceManager::onMidiMessage = midiMesageHandler;
+```
+
+</CodeRef>
+
+That matters for the design sketch below. The handler at lines 73 to 76 runs on the message thread, after an asynchronous hop. A message thread that is busy drawing a screen delays every message in the queue. If you measure the spacing of incoming clock bytes there, you measure the screen's load, not the sender's tempo.
+
+### What the gap means for syncing
+
+- **Playing along with a DAW.** The DAW's tempo changes are ignored. Its Start does not start the KICK. You press play on both, by hand.
+- **Drift.** Two free-running clocks never agree exactly. If the two differ by 0.01 percent, after 10 minutes they are 60 ms apart (600 s x 0.0001). Hand-started loops slide against each other.
+- **Following gear.** A box that sends MIDI clock into the KICK gets no response. The KICK is only a note source.
+
+### Is there an external-sync path hidden in the clock class?
+
+Yes, half of one. `CMidiClock` has a sync mode switch, an external tick method and an interval averager:
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.h" line={104} expect="setClockSyncMode">
+
+```cpp
+void        setClockSyncMode( SyncMode tempo_mode ) noexcept { syncMode = tempo_mode; }
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.h" line={130} expect="intPPQN / extPPQN">
+
+```cpp
+inline void recomputePPQNFactor() noexcept { intClockPulsesPerExtClockPulse = intPPQN / extPPQN; };
+```
+
+</CodeRef>
+
+At 96 over 24 that is 4 internal ticks for each external pulse. But I searched the whole checkout at the pinned commit for callers of `tickExternal`, `setClockSyncMode` and `setExternalPPQN`, outside the clock files. There are none. The class stays in internal mode forever, and the external code is never called.
+
+If someone turned it on, it would not work as written. When an external pulse arrives, the code sets the old timestamp equal to the new one and then subtracts them:
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.cpp" line={194} expect="ts = te;">
+
+```cpp
+ts = te;
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.cpp" line={200} expect="te - ts">
+
+```cpp
+auto intervalUs              = te - ts;
+```
+
+</CodeRef>
+
+The interval is always zero. The averager then divides by the number of non-zero intervals:
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/CMidiClock.cpp" line={315} expect="/ count );">
+
+```cpp
+return ( ( average * extPPQN ) / count );
+```
+
+</CodeRef>
+
+With every interval zero, `count` is zero, and an integer divide by zero is undefined behavior in C++. Again: I read this and I did not run it. It is dead code, so nothing hits it today. It is a warning for anyone who flips the switch.
+
+## MIDI clock out, and CV/gate
+
+**MIDI out.** The device manager can create eight virtual MIDI outputs on Linux, named `Kick:Out:1` to `Kick:Out:8`:
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/midi_device_manager.cpp" line={48} expect="MidiOutput::createNewDevice">
+
+```cpp
+juce::MidiOutput::createNewDevice( "Kick:Out:" + juce::String( i + 1 ) );
+```
+
+</CodeRef>
+
+A MIDI-type program sends its notes out through them, from the tick thread, as soon as `noteProcess` runs:
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_midi_program.cpp" line={118} expect="ae.sendMidiMessage( midiPort.get(), it )">
+
+```cpp
+ae.sendMidiMessage( midiPort.get(), it );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_midi/source/midi_device_manager.cpp" line={320} expect="sendMessageNow( Msg )">
+
+```cpp
+midiOutput->outDevice->sendMessageNow( Msg );
+```
+
+</CodeRef>
+
+`sendMessageNow` sends immediately with no timestamp (general JUCE knowledge). So outgoing MIDI notes carry all the jitter the tick thread has.
+
+Outgoing clock is a different story. I searched `Kick` and the `AudIO` core and DAW folders, ignoring case, for any code that builds a MIDI clock, start, stop or continue message, or the raw bytes for them. The only hits are the four empty branches above. So I found no outgoing MIDI clock. The box does not tell other gear where it is in the bar.
+
+**CV and gate.** A CV program is another program type. Its note-on sets a gate and a note voltage. Look at what it does with the gate:
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_cv_program.cpp" line={65} expect="setGate( !noteOns.isEmpty() )">
+
+```cpp
+setGate( !noteOns.isEmpty() );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_cv_program.cpp" line={122} expect="setVoltageOn( getGatePort() )">
+
+```cpp
+cvinterface.setVoltageOn( getGatePort() );
+```
+
+</CodeRef>
+
+`setVoltageOn` ends in a plain write to the I2C device from Module 1, the CV chip at address 0x0c on `/dev/i2c-3`:
+
+<CodeRef path="Kick/modules/hardware/source/kick_I2c.cpp" line={34} expect="/dev/i2c-3">
+
+```cpp
+: devicePath_( "/dev/i2c-3" ), address_( 0xc ), file_( -1 ), isDeviceOpen_( false )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/hardware/source/kick_I2c.cpp" line={212} expect="i2c.writeBytes">
+
+```cpp
+if( !i2c.writeBytes( buffer, sizeof( buffer ) ) )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/hardware/source/kick_I2c.cpp" line={99} expect="write( file_, data, length )">
+
+```cpp
+ssize_t bytesWritten = write( file_, data, length );
+```
+
+</CodeRef>
+
+That is a system call, and Module 6's ban table lists I/O on the audio thread. So gate edges come from the same tick thread as everything else, and they carry the same jitter. A gate can be no more precise than the tick that caused it.
+
+I did not find a dedicated clock-pulse output. There is no code that sends a pulse per tick or per 16th to a jack. A CV track whose notes land on a grid does give you a clock-like gate, one edge pair per note. For a true clock out you would have to write one. The cost per edge: an I2C write is the address byte plus three data bytes, 4 x 9 = 36 bit times. At a typical 100 kHz bus speed that is 0.36 ms. I did not read the real bus speed from the device tree, so treat 0.36 ms as an estimate.
+
+<Aside type="caution" title="Not verified on hardware">
+None of the CV timing above was measured. I have no scope trace of a gate edge against the tick that caused it. The 0.36 ms figure is arithmetic on an assumed bus speed.
+</Aside>
+
+## The metronome
+
+The click is a small drum-like program that is triggered from the sequence's bar and beat signals:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_metronome.h" line={41} expect="signals::onBar.connect">
+
+```cpp
+signals::onBar.connect( [&]( int ) { triggerBar(); } );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_metronome.h" line={76} expect="noteOn( 0, 127 )">
+
+```cpp
+_metronome->noteOn( 0, 127 );
+```
+
+</CodeRef>
+
+The signals are emitted from the sequence's `onBar`, which runs on the tick thread. If the signal library calls its slots right away, the click starts through the same flag-flip path as a drum hit, with the same jitter. I did not read the signal library, so that part is an assumption.
+
+## Why it is built this way
+
+The shape makes sense for how this app grew. The sequencer, its UI and its programs were written as ordinary desktop JUCE code. A `HighResolutionTimer` is the easy way to get a steady beat on any platform, and it works the same on a laptop and on the box. A second thread keeps slow program code, with its allocations and its I2C writes, away from the timer. The running-total tick counter is a good idea: it avoids drift and lets consumers survive gaps if they loop over the ticks in between, as the track does.
+
+What the design gives up is exactly the property a drum machine is supposed to have: timing locked to the audio clock. It also leaves external sync unconnected.
+
+## Customization pointers
+
+These are sketches. I have not built or run any of them.
+
+### Implement external MIDI sync
+
+1. **Catch the bytes early.** The handler at `mt_audio_manager.cpp:73` runs on the message thread after an async hop. Put the work in `handleIncomingMidiMessage`, which the source comments as running on the MIDI thread. Stamp each clock byte there with a monotonic clock.
+2. **Count, do not act.** On a clock byte, increment an atomic pulse counter and store its timestamp. On Start, set an atomic flag. Continue and Stop get flags too. No allocation, no lock.
+3. **Make the tick thread consume them.** Each time it wakes, it reads the counter. Internal ticks come from external pulses: 4 ticks per pulse, from the 96 over 24 ratio the class already computes. Between pulses, interpolate with the measured pulse spacing, averaged over several pulses so one late byte does not move tempo.
+4. **Map transport.** Start calls `play( seq, true, true )` from the beginning. Continue calls `resume`. Stop calls `stop`. Song Position Pointer, if you want it, maps to `seek`.
+5. **Reuse or replace.** `CMidiClock` already has the switch and a place for external ticks. Fix the zero-interval bug and the divide by zero first, or write a smaller class.
+6. **Decide the tempo display.** While locked, the BPM on screen should show the measured tempo and ignore the stored one.
+
+The risk: this design still sits on the tick thread. Its error budget is the thread's jitter. The sync would be loose, not tight. To tighten it, the same counter should be read from the audio callback.
+
+### Sample-accurate scheduling
+
+Count audio frames in the callback. Given the block start frame and the block length, compute which ticks fall inside, using the frame-per-tick figure from the table (250 at 120 BPM). Give each note-on a frame offset and let the voice start its read at that offset. This needs the lock-free hand-off described in Module 6, because notes would flow from the editing side to the audio thread through a queue.
+
+### Clock out
+
+For MIDI clock out, send the clock byte once every 4 internal ticks from wherever the tick is counted. For a pulse on a CV jack, toggle a gate channel once per pulse. Both inherit the jitter of the thread that sends them, so doing it from the audio-side tick counter is the version that sounds tight.
+
+## Try it yourself
+
+With the upstream clone at the pinned commit, do a grep tour that follows one tick to one voice. Write one sentence for each answer.
+
+```bash
+# 1. Where does the clock get its tick rate?
+grep -n "sTickFactor" Kick/modules/engine/audio_midi/source/CMidiClock.cpp
+# 2. Where is the callback that hands the tick to the transport?
+grep -n "midiClock.onTick" Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp
+# 3. Which thread is created at construction?
+grep -n "std::thread" Kick/modules/engine/audio_engine/engine/mt_audio_manager_transport.cpp
+# 4. Where does a track turn a stored note into a note-on?
+grep -n "MidiMessage::noteOn" Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp
+# 5. Where does the track call its program?
+grep -n "noteProcess" Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp
+# 6. Where does a voice flip to RUNNING?
+grep -n "makeRunning" Kick/modules/engine/audio_program/synth/*.cpp Kick/modules/engine/audio_program/synth/*.h
+# 7. Who calls the external clock code?
+grep -rn "tickExternal\|setClockSyncMode" Kick
+# 8. What happens to an incoming clock byte?
+grep -n "isMidiClock" -A4 Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp
+```
+
+Then answer these:
+
+1. Write the chain from `CMidiClock.cpp:282` to `iSynthVoice.h:40` as a list of function names. Mark which thread runs each one.
+2. At 100 BPM and 96 PPQN, what is the tick period in milliseconds? How many audio frames is that at 48 kHz? (Show the arithmetic.)
+3. Run the grep for question 7. What does the result say about whether the box can follow a DAW's tempo?
+4. Optional, if you can build the app on a desktop: add a line to `fillMidiMessages` that logs `juce::Time::getMillisecondCounterHiRes()` when it inserts a note-on. Play a 16th-note pattern at 120 BPM. How far do the logged gaps wander from 125 ms?
+
+## Check yourself
+
+<Quiz
+  items={[
+    {
+      q: 'The clock runs at 96 PPQN. At 120 BPM, how long is one tick?',
+      options: [
+        '20.8 ms',
+        '10.4 ms',
+        '5.2 ms',
+        '1.0 ms',
+      ],
+      answer: 2,
+      why: 'At 120 BPM a quarter note is 500 ms. 500 divided by 96 is 5.208 ms. The 20.8 ms answer is the tick of a 24 PPQN clock.',
+    },
+    {
+      q: 'Which thread runs the sequencer when a sequenced note starts a voice?',
+      options: [
+        'The audio callback thread',
+        'The message thread',
+        'A JUCE timer thread hands ticks to a separate std::thread that runs the sequence',
+        'The kernel',
+      ],
+      answer: 2,
+      why: 'CMidiClock uses a JUCE high-resolution timer. Its tick wakes a worker thread the transport creates, and that worker runs the sequence, track and program. The audio thread only sees the voice flag change at its next block.',
+    },
+    {
+      q: 'A DAW sends MIDI Start and a stream of clock bytes to the KICK. What does the stock code do?',
+      options: [
+        'Starts the sequencer and follows the DAW tempo',
+        'Follows the tempo but ignores Start',
+        'Catches them in empty branches and discards them',
+        'Passes them on to the MIDI outputs',
+      ],
+      answer: 2,
+      why: 'The handler has branches for clock, start, stop and continue, and all four are empty. No other code consumes them. The external-sync code in CMidiClock has no callers.',
+    },
+    {
+      q: 'The track loops over every tick from PrevTick plus 1 up to the current tick. Why?',
+      options: [
+        'To play each note several times',
+        'Because the clock can jump the tick number by 2, and a note on the skipped tick must still fire',
+        'To avoid taking a lock',
+        'Because MIDI files require it',
+      ],
+      answer: 1,
+      why: 'The clock reports a whole-number part of an elapsed-time total. A callback can advance it by more than 1. Visiting every tick in between keeps a note on the skipped number from being lost.',
+    },
+    {
+      q: 'You drag the swing slider on the Timing Correct dialog at the pinned commit. What changes in playback?',
+      options: [
+        'Every second note is delayed by the slider percent',
+        'Only the note-offs move',
+        'Nothing that I can find. The handler is empty',
+        'The clock PPQN changes',
+      ],
+      answer: 2,
+      why: 'The slider has a range of 50 to 75, but its onValueChanged handler is an empty lambda, and closing the dialog only deletes it. Playback has no swing step.',
+    },
+  ]}
+/>
+
+## Words to know
+
+| Term | Meaning |
+|------|---------|
+| Clock | A source of regular counts that the sequencer uses to know where it is in the song |
+| PPQN | Pulses per quarter note. How many ticks make up one quarter note |
+| Tick | One count of the clock. In the KICK, 1/96 of a quarter note |
+| BPM | Beats per minute. The tempo |
+| Pulse | One MIDI clock byte. The standard sends 24 per quarter note |
+| MIDI Start, Stop, Continue | MIDI realtime bytes that tell other gear to begin, halt or resume from where it halted |
+| Transport | The state and controls for moving time: play, pause, stop, seek, loop |
+| Sequence | A bar-based pattern made of tracks, each with notes and a program |
+| Song mode | A queue of sequences, each played for a set number of repeats, one after another |
+| High-resolution timer | A timer that tries to call back every millisecond or finer, on a thread of its own |
+| Monotonic clock | A clock that only moves forward and never jumps, unlike wall-clock time. Right for measuring intervals |
+| Latency | The delay between an intended time and the actual time |
+| Jitter | How much the latency varies from one event to the next |
+| Sample-accurate | An event lands on an exact audio frame, not just somewhere in the block |
+| Swing | Delaying every second note of a pair to make a shuffle feel |
+| Quantize | Snapping note times to a grid |
+| Ratchet | Splitting one note into several quick repeats |
+| Gate | A voltage that is high while a note is held and low otherwise |
+| PLL | Phase-locked loop. A circuit or routine that follows an incoming rhythm and keeps its own count in step |
+
+Next: Module 9 (coming soon).

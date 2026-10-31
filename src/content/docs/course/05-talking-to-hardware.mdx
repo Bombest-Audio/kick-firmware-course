@@ -1,0 +1,1720 @@
+---
+title: '5. Talking to the hardware'
+description: How a pad press becomes a message the app understands, and how an LED command travels back. The frame layout, a checksum worked by hand, the receive state machine, and the threads in between.
+---
+
+import { Image } from 'astro:assets';
+import { Aside } from '@astrojs/starlight/components';
+import CodeRef from '../../../components/CodeRef.astro';
+import Quiz from '../../../components/Quiz.astro';
+import hero from '../../../assets/heroes/m05-talking-to-hardware.png';
+
+<Image src={hero} alt="Two small dark devices pass short glowing blue packets back and forth along one thin line." />
+
+**Module 5 of 12 &#183; about 45 minutes &#183; needs Module 4**
+
+Every pad you hit, every knob you turn and every button light you see goes through one thin wire. On one end is a small microcontroller, the MCU, which scans the pads. On the other end is the KICK app. Between them runs a short, strict language.
+
+By the end of this lesson you will be able to read one frame of that language byte by byte, compute its checksum by hand, say which thread touches it at each step, and trace a pad press from the serial port to the line that starts a sample.
+
+One limit up front. The MCU firmware is not in this repository. Everything I say about what the MCU sends comes from what the app expects to receive. The one exception is the packet class itself, which is shared. The same source file has a branch for the MCU build:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={3} expect="#ifdef KICK_MCU">
+
+```cpp
+#ifdef KICK_MCU
+```
+
+</CodeRef>
+
+<Aside type="note" title="Analogy">
+Two people pass notes through a slot in a wall. Every note uses the same envelope. It opens with a two-letter stamp so the reader knows a note began. Then it says what kind of note it is, what it asks for, and how long the contents are. Then the contents. Then a check digit the writer worked out from everything before it. The reader works out the same digit. If the two digits differ, the note goes in the bin. Nobody writes back to say it was bad.
+</Aside>
+
+## The whole trip in two pictures
+
+Going in, from pad to sound:
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>Pad press</b><span class="layer layer-hardware">hardware</span><br />The MCU builds a frame and sends it down the UART. Not in this repository.</div>
+    <div class="kd-step"><b>Serial callback</b><span class="layer layer-message">message thread</span><br />changeListenerCallback reads the bytes the port has collected.</div>
+    <div class="kd-step"><b>Frame check</b><span class="layer layer-message">message thread</span><br />The CPktMgr state machine walks the fields and checks the CRC.</div>
+    <div class="kd-step"><b>HWMsg_t</b><span class="layer layer-message">message thread</span><br />The callback copies the fields into a struct and fires dispatchHardwareEvent.</div>
+    <div class="kd-step"><b>Adapter</b><span class="layer layer-message">message thread</span><br />KickDeviceAdapter forwards it on hardwareInputTriggered.</div>
+    <div class="kd-step"><b>KickHome</b><span class="layer layer-message">message thread</span><br />handleCommand picks a handler: a global button, or the current screen.</div>
+    <div class="kd-step"><b>Screen</b><span class="layer layer-message">message thread</span><br />PadPerform::handleCommand turns the pad into a MIDI note on.</div>
+    <div class="kd-step"><b>Engine</b><span class="layer layer-audio">engine</span><br />addLiveMidiMsg reaches the track and program. Modules 6 and 7 follow it onto the audio thread.</div>
+  </div>
+  <figcaption>Inbound. Boxes 2 to 7 are all on the message thread. The label on box 2 is general JUCE knowledge, explained below.</figcaption>
+</figure>
+
+Coming back, from an app event to a lit LED:
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>App event</b><span class="layer layer-message">caller's thread</span><br />Playback state changes. KickLEDs listens. I did not check which thread fires that signal.</div>
+    <div class="kd-step"><b>Build</b><span class="layer layer-message">caller's thread</span><br />DclContractsHelper packs the command into a JSON message.</div>
+    <div class="kd-step"><b>Forward</b><span class="layer layer-message">caller's thread</span><br />sendCommandToDcl reaches KickDeviceAdapter, which rebuilds an HWMsg_t.</div>
+    <div class="kd-step"><b>Queue</b><span class="layer layer-message">caller's thread</span><br />sendMessageToHardware drops it on a lock-free queue and pokes a wake-up.</div>
+    <div class="kd-step"><b>Frame</b><span class="layer layer-userspace">"Queue" thread</span><br />BuildAndTransmitPacket makes the bytes, CRC last.</div>
+    <div class="kd-step"><b>Write</b><span class="layer layer-userspace">"Queue" thread</span><br />The bytes go down the UART. The MCU lights the LED.</div>
+  </div>
+  <figcaption>Outbound. The send side has its own thread so that nobody on the message thread waits on the port.</figcaption>
+</figure>
+
+I will take the pieces in the order a byte meets them: the wire, the frame, the state machine, the struct, the threads, the dispatch, then the way back.
+
+## The wire
+
+Module 1 covered this, so here is the short version. The port is a UART at 230400 baud, 8 data bits, no parity, 1 stop bit. The path is hard-coded:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={46} expect="ttymxc0">
+
+```cpp
+if( juce::File( "/dev/ttymxc0" ).exists() )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={61} expect="SerialPortConfig config( 230400, 8,">
+
+```cpp
+SerialPortConfig config( 230400, 8, SerialPortConfig::SERIALPORT_PARITY_NONE, SerialPortConfig::STOPBITS_1, SerialPortConfig::FLOWCONTROL_NONE );
+```
+
+</CodeRef>
+
+The whole `connect()` body sits inside a Linux-only guard, so on a Mac it compiles to nothing:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={45} expect="#if( JUCE_LINUX || __linux__ )">
+
+```cpp
+#if( JUCE_LINUX || __linux__ )
+```
+
+</CodeRef>
+
+One naming trap. The packet class and the buffers say "USB". The channel enum has one member, `EN_COM_CHANNEL_USB`, and the buffer is `ms_arrui8RxBufferUsb`. The README also says "over USB". The port the app actually opens is the UART above. I read the "USB" in those names as a leftover and did not find a USB path for these packets.
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.hpp" line={17} expect="EN_COM_CHANNEL_USB = 0,">
+
+```cpp
+EN_COM_CHANNEL_USB = 0,
+```
+
+</CodeRef>
+
+## Frame anatomy
+
+A frame is a run of bytes. The sender's code shows the order, because it pushes the fields one after another. First the two start letters:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={164} expect="f_txData.push_back( 'M' );">
+
+```cpp
+f_txData.push_back( 'M' );
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={165} expect="f_txData.push_back( 'T' );">
+
+```cpp
+f_txData.push_back( 'T' );
+```
+
+</CodeRef>
+
+Then the type, the direction and the command:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={166} expect="f_HwMsg.pktType">
+
+```cpp
+f_txData.push_back( f_HwMsg.pktType );
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={167} expect="f_HwMsg.pktDir">
+
+```cpp
+f_txData.push_back( f_HwMsg.pktDir );
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={168} expect="f_HwMsg.pktCmd">
+
+```cpp
+f_txData.push_back( f_HwMsg.pktCmd );
+```
+
+</CodeRef>
+
+Then the size, then the data bytes, then the CRC:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={169} expect="sizeValue + PKTMGR_CRC_BYTE">
+
+```cpp
+f_txData.push_back( sizeValue + PKTMGR_CRC_BYTE );
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={173} expect="f_HwMsg.data[txIndex]">
+
+```cpp
+f_txData.push_back( f_HwMsg.data[txIndex] );
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={178} expect="f_txData.push_back( CrcGen( f_txData ) );">
+
+```cpp
+f_txData.push_back( CrcGen( f_txData ) );
+```
+
+</CodeRef>
+
+| Position | Field | What it holds |
+|---|---|---|
+| 0 | start | the letter `M`, 0x4D |
+| 1 | start | the letter `T`, 0x54 |
+| 2 | type | a value from the packet-type enum: SYSTEM 0, BUTTON 1, LED 2, PAD 3, KNOBS 4, MIDI 5, CV 6, SLIDER 7 |
+| 3 | direction | 0 for request, 1 for response |
+| 4 | command | which operation inside that type |
+| 5 | size | number of data bytes, plus one |
+| 6 onward | data | the payload, one byte per value |
+| last | CRC | checksum over every byte before it |
+
+The type numbers come from the enum order. The enum is the same list Module 1 showed:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.hpp" line={34} expect="enum enumPacketType">
+
+```cpp
+enum enumPacketType
+```
+
+</CodeRef>
+
+### The size byte counts the CRC
+
+This is the detail Module 1 glossed over. The size field is not the number of data bytes. It is the number of data bytes plus the CRC byte. The sender adds one on line 169 above. The receiver subtracts it back off when it collects data:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={87} expect="m_ui8FrameSize - 1">
+
+```cpp
+if( m_ui8RxFifoWritePos < ( m_ui8FrameSize - 1 ) )
+```
+
+</CodeRef>
+
+So a frame with 3 data bytes has a size field of 4 and is 10 bytes long: 2 start, 3 header, 1 size, 3 data, 1 CRC. The general rule is `data + 7`.
+
+### The frame has one extra byte on the way in
+
+The reader in the app expects frames from the MCU to be one byte longer than the frames the app sends. Look at how it computes the length of a frame it is about to read:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={181} expect="byteArray[5 + pktIndex] + 7;">
+
+```cpp
+int packetLength = byteArray[5 + pktIndex] + 7;
+```
+
+</CodeRef>
+
+`byteArray[5]` is the size field. The size field already includes the CRC, so size + 6 would be the whole frame. The code uses size + 7. Then, while feeding bytes to the state machine, it skips the last one:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={188} expect="if( packetLength">
+
+```cpp
+if( packetLength > 1 )
+```
+
+</CodeRef>
+
+That last byte is read from the buffer and thrown away. I infer that the MCU ends every frame with one extra byte after the CRC. There is a hint in the state enum, which has a member after `EN_FRM_STATE_CRC` called end-of-frame:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.hpp" line={31} expect="EN_FRM_EOF = 8">
+
+```cpp
+EN_FRM_EOF = 8
+```
+
+</CodeRef>
+
+And on the send side, a line that would append a newline is commented out:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={179} expect="//f_txData.push_back(">
+
+```cpp
+//f_txData.push_back('\n');
+```
+
+</CodeRef>
+
+So frames the app sends have no trailer, and frames the app receives are expected to have one. If the MCU left it off, the length check at line 184 would fail and the frame would be dropped (more on that under errors). I could not confirm the trailer value, because the MCU code is not here.
+
+### The checksum
+
+The CRC is a one-byte checksum. Here is the whole routine. Four lines carry the idea. It starts at 0xFF:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={132} expect="uint8_t ui8CrcValue = 0xff;">
+
+```cpp
+uint8_t ui8CrcValue = 0xff;
+```
+
+</CodeRef>
+
+For each byte, it XORs the byte into the running value:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={138} expect="ui8CrcValue ^= f_txData[i];">
+
+```cpp
+ui8CrcValue ^= f_txData[i];
+```
+
+</CodeRef>
+
+Then it does eight rounds of shifting. If the top bit is set, it shifts left and XORs with 0x31:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={141} expect="if( ( ui8CrcValue & 0x80 ) != 0 )">
+
+```cpp
+if( ( ui8CrcValue & 0x80 ) != 0 )
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={142} expect="^ 0x31 );">
+
+```cpp
+ui8CrcValue = (uint8_t)( ( ui8CrcValue << 1 ) ^ 0x31 );
+```
+
+</CodeRef>
+
+If the top bit is clear, it only shifts left. The result after the last byte is the CRC. The receiver runs the same routine over everything it has collected before the CRC byte and compares:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={100} expect="CrcGen( ui8TempReceiveData )">
+
+```cpp
+ui8CrcTemp         = CrcGen( ui8TempReceiveData );
+```
+
+</CodeRef>
+
+Why bother with the shift-and-XOR dance? A plain sum of bytes would miss two errors that cancel out. This routine treats the bytes as one long binary number and keeps the remainder of a division, which makes it catch bursts of flipped bits. That is general knowledge about CRCs, not something the repository explains.
+
+## A worked example, byte by byte
+
+I built two frames from the real field order and values.
+
+### Example 1: an LED command, app to MCU
+
+When playback starts, `KickLEDs` asks for the Play button's LED to turn on. The call is:
+
+<CodeRef path="Kick/modules/kick_leds/kick_leds.cpp" line={57} expect="EN_PLAY">
+
+```cpp
+contracts::DclSignals::sendCommandToDcl( contracts::DclContractsHelper::setMediaControlMessage( contracts::DeviceControlContracts::BtnLedSequence::EN_PLAY ) );
+```
+
+</CodeRef>
+
+The helper packs three data values (button id, state, and a literal 1) into an LED-type message:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts_helper.cpp" line={200} expect="data{ btnId, DeviceControlContracts::PadButtonState::StateOn, 1 };">
+
+```cpp
+std::vector<int> data{ btnId, DeviceControlContracts::PadButtonState::StateOn, 1 };
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts_helper.cpp" line={201} expect="EN_PKT_TYPE_LED">
+
+```cpp
+return prepareHWMessage( CPktMgr::enumPacketType::EN_PKT_TYPE_LED, CPktMgr::enumPacketDir::EN_PKT_REQUEST, DeviceControlContracts::LedCmd::EN_LED_SET_SINGLE_LED, data );
+```
+
+</CodeRef>
+
+The values behind those names:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts.h" line={193} expect="EN_PLAY         = 45,">
+
+```cpp
+EN_PLAY         = 45,
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts.h" line={224} expect="EN_LED_SET_SINGLE_LED = 0,">
+
+```cpp
+EN_LED_SET_SINGLE_LED = 0,
+```
+
+</CodeRef>
+
+`StateOn` is the member right after `StateOff = 0` in the pad-state enum, so it is 1:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts.h" line={56} expect="StateOff = 0,">
+
+```cpp
+StateOff = 0, // pads are off cannot be higlighted or clicked
+```
+
+</CodeRef>
+
+That gives:
+
+| Field | Value | Hex |
+|---|---|---|
+| start | `M` `T` | 4D 54 |
+| type | LED | 02 |
+| direction | request | 00 |
+| command | set single LED | 00 |
+| size | 3 data bytes + 1 | 04 |
+| data | button 45, state 1, 1 | 2D 01 01 |
+| CRC | worked out below | CD |
+
+<figure class="kd">
+  <div class="kd-pkt">
+    <div class="kd-byte layer-hardware"><small>start</small>4D</div>
+    <div class="kd-byte layer-hardware"><small>start</small>54</div>
+    <div class="kd-byte layer-userspace"><small>type</small>02</div>
+    <div class="kd-byte layer-userspace"><small>direction</small>00</div>
+    <div class="kd-byte layer-userspace"><small>command</small>00</div>
+    <div class="kd-byte layer-message"><small>size</small>04</div>
+    <div class="kd-byte layer-kernel"><small>data</small>2D</div>
+    <div class="kd-byte layer-kernel"><small>data</small>01</div>
+    <div class="kd-byte layer-kernel"><small>data</small>01</div>
+    <div class="kd-byte layer-bootloader"><small>crc</small>CD</div>
+  </div>
+  <figcaption>The Play LED frame, 10 bytes, in the same colors as Module 1's packet picture. No trailing byte on the way out.</figcaption>
+</figure>
+
+Now the CRC, by hand. Start with 0xFF and take the first byte, 0x4D. The XOR gives 0xB2, which is `10110010`. Then eight rounds:
+
+| Round | Top bit before shift | Action | Result |
+|---|---|---|---|
+| 1 | 1 | shift left, XOR 0x31 | 0x55 |
+| 2 | 0 | shift left | 0xAA |
+| 3 | 1 | shift left, XOR 0x31 | 0x65 |
+| 4 | 0 | shift left | 0xCA |
+| 5 | 1 | shift left, XOR 0x31 | 0xA5 |
+| 6 | 1 | shift left, XOR 0x31 | 0x7B |
+| 7 | 0 | shift left | 0xF6 |
+| 8 | 1 | shift left, XOR 0x31 | 0xDD |
+
+Round 1: 0xB2 shifted left is 0x164, which drops to 0x64 in one byte, and 0x64 XOR 0x31 is 0x55. Round 3: 0xAA shifted left is 0x54 in one byte, and 0x54 XOR 0x31 is 0x65. The other rounds work the same way. After the first byte the running value is 0xDD. The same process for every byte gives:
+
+| After byte | Running CRC |
+|---|---|
+| 4D | DD |
+| 54 | F2 |
+| 02 | 82 |
+| 00 | 18 |
+| 00 | FA |
+| 04 | 9D |
+| 2D | BF |
+| 01 | A0 |
+| 01 | CD |
+
+The last value, 0xCD, goes at the end of the frame. I did the first byte on paper and ran the loop for the rest. To check the whole thing against the real code, I pulled `PktMgr.cpp` and `PktMgr.hpp` at the pinned commit, built them on my Mac with a scratch `main`, and called `BuildAndTransmitPacket` with this message. It printed `4D 54 02 00 00 04 2D 01 01 CD`. That is a desktop test of the packet class alone. It is not the app, and it is not hardware.
+
+### Example 2: a pad press, MCU to app
+
+For the inbound side the structure is the same. The values here are made up to show the shape, because I cannot see what the real MCU sends. The field order and the meaning of each data byte come from the app's reader. Pad number, state, velocity and aftertouch are `data[0]` to `data[3]`:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts_helper.cpp" line={81} expect="getPadNumber">
+
+```cpp
+int DclContractsHelper::getPadNumber( const CPktMgr::HWMsg_t& hwMsg ) { return hwMsg.data[0]; }
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts_helper.cpp" line={84} expect="getPadAftertouch">
+
+```cpp
+int DclContractsHelper::getPadAftertouch( const CPktMgr::HWMsg_t& hwMsg ) { return hwMsg.data[3]; }
+```
+
+</CodeRef>
+
+A pad message is the PAD type with command `EN_PAD_STATE`, which is 0:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts_helper.cpp" line={38} expect="EN_PAD_STATE">
+
+```cpp
+bool DclContractsHelper::isPadButtonMessage( const CPktMgr::HWMsg_t& hwMsg ) { return ( hwMsg.pktType == CPktMgr::enumPacketType::EN_PKT_TYPE_PAD ) && ( hwMsg.pktCmd == contracts::DeviceControlContracts::PadCmd::EN_PAD_STATE ); }
+```
+
+</CodeRef>
+
+Pads are numbered from zero, so the third pad is 2:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts.h" line={91} expect="EN_PAD1 = 0,">
+
+```cpp
+EN_PAD1 = 0,
+```
+
+</CodeRef>
+
+For velocity and aftertouch I used 80 and 100, which are the numbers the desktop keyboard stand-in invents (more on that in the customization section). Pressed is 1:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts.h" line={217} expect="BTN_PRESSED,">
+
+```cpp
+BTN_PRESSED,
+```
+
+</CodeRef>
+
+So the frame is `4D 54 03 00 00 05 02 01 50 64`, then CRC `03`, then one trailer byte whose value I do not know. Size is 4 data bytes + 1 = 5, so the app computes a length of 5 + 7 = 12 and expects 11 real bytes plus the trailer.
+
+<figure class="kd">
+  <div class="kd-pkt">
+    <div class="kd-byte layer-hardware"><small>start</small>4D</div>
+    <div class="kd-byte layer-hardware"><small>start</small>54</div>
+    <div class="kd-byte layer-userspace"><small>type</small>03</div>
+    <div class="kd-byte layer-userspace"><small>direction</small>00</div>
+    <div class="kd-byte layer-userspace"><small>command</small>00</div>
+    <div class="kd-byte layer-message"><small>size</small>05</div>
+    <div class="kd-byte layer-kernel"><small>pad</small>02</div>
+    <div class="kd-byte layer-kernel"><small>state</small>01</div>
+    <div class="kd-byte layer-kernel"><small>velocity</small>50</div>
+    <div class="kd-byte layer-kernel"><small>aftertouch</small>64</div>
+    <div class="kd-byte layer-bootloader"><small>crc</small>03</div>
+    <div class="kd-byte"><small>trailer</small>??</div>
+  </div>
+  <figcaption>A made-up pad press. The CRC is real for these bytes. The trailer value is unknown.</figcaption>
+</figure>
+
+I fed the 11 bytes through the scratch build's `PushByteToRxFifo`. It set the frame-complete flag and left type 3, command 0, size 5 and the four data bytes in the FIFO. Changing the CRC byte from 03 to 04 left the flag clear. Same caveat: desktop, packet class only.
+
+## The receive state machine
+
+The class that reads bytes is `CPktMgr`. You hand it one byte at a time, and a `switch` on the current state decides what the byte means. Here are the eight states in the enum:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.hpp" line={21} expect="enum enumFrameState">
+
+```cpp
+enum enumFrameState
+```
+
+</CodeRef>
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>INIT_1</b><span class="layer layer-hardware">start</span><br />Waiting for M. Every byte is stored; only an M moves on.</div>
+    <div class="kd-step"><b>INIT_2</b><span class="layer layer-hardware">start</span><br />Waiting for T. Any other byte is stored and the machine stays here.</div>
+    <div class="kd-step"><b>TYPE</b><span class="layer layer-userspace">header</span><br />Store the packet type.</div>
+    <div class="kd-step"><b>DIR</b><span class="layer layer-userspace">header</span><br />Store request or response.</div>
+    <div class="kd-step"><b>ID</b><span class="layer layer-userspace">header</span><br />Store the command number.</div>
+    <div class="kd-step"><b>SIZE</b><span class="layer layer-message">header</span><br />Store the size. A size of 0 jumps straight to CRC.</div>
+    <div class="kd-step"><b>DATA</b><span class="layer layer-kernel">payload</span><br />Collect size minus 1 bytes into the FIFO, then move on.</div>
+    <div class="kd-step"><b>CRC</b><span class="layer layer-bootloader">check</span><br />Compare. Match sets the frame-complete flag. Either way, clear the scratch buffer.</div>
+  </div>
+  <figcaption>Receive states, in order. Nothing moves the machine out of CRC; the caller resets it.</figcaption>
+</figure>
+
+Walking the code, state by state. The first two states hunt for the stamp:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={44} expect="if( f_ui8Data == 'M' )">
+
+```cpp
+if( f_ui8Data == 'M' )
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={52} expect="if( f_ui8Data == 'T' )">
+
+```cpp
+if( f_ui8Data == 'T' )
+```
+
+</CodeRef>
+
+Each header state stores its byte and moves on. TYPE, DIR and ID remember the value in a member:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={60} expect="m_enPktType  = (enumPacketType)f_ui8Data;">
+
+```cpp
+m_enPktType  = (enumPacketType)f_ui8Data;
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={66} expect="m_enPktDir   = (enumPacketDir)f_ui8Data;">
+
+```cpp
+m_enPktDir   = (enumPacketDir)f_ui8Data;
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={71} expect="m_ui8RxCommand = f_ui8Data;">
+
+```cpp
+m_ui8RxCommand = f_ui8Data;
+```
+
+</CodeRef>
+
+SIZE has a special case. A size of zero skips the data state:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={79} expect="if( m_ui8FrameSize == 0x00 )">
+
+```cpp
+if( m_ui8FrameSize == 0x00 )
+```
+
+</CodeRef>
+
+DATA copies bytes into the caller's FIFO until it has size minus 1 of them (line 87, shown earlier). The CRC state compares and, on a match, raises the flag. Look at what the code does when the CRC does not match: nothing, except clear the scratch buffer.
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={101} expect="if( ui8CrcTemp == f_ui8Data )">
+
+```cpp
+if( ui8CrcTemp == f_ui8Data )
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={105} expect="ui8TempReceiveData.clear();">
+
+```cpp
+ui8TempReceiveData.clear();
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={111} expect="m_boFrameRcvComplete = TRUE;">
+
+```cpp
+m_boFrameRcvComplete = TRUE;
+```
+
+</CodeRef>
+
+Four things in this machine surprised me.
+
+- **The scratch buffer is a function-local `static`.** Every byte is also stored in a shared vector, and the CRC is computed over it. Because it is `static`, it survives between calls and is shared by every `CPktMgr` object.
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={37} expect="ui8TempReceiveData;">
+
+```cpp
+static std::vector<char> ui8TempReceiveData;
+```
+
+</CodeRef>
+
+- **The machine never resets itself.** After the CRC state it stays in the CRC state. Only `Init` and `ClearReceiver` put it back to INIT_1. The caller has to call one of them after every frame, good or bad.
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.cpp" line={32} expect="m_enFrmState         = EN_FRM_STATE_INIT_1;">
+
+```cpp
+m_enFrmState         = EN_FRM_STATE_INIT_1;
+```
+
+</CodeRef>
+
+- **INIT_2 does not fall back.** If the byte after an `M` is not `T`, the machine stays in INIT_2 and keeps storing bytes. It never goes back to hunting for `M`. In practice this does not bite, because the app's reader only feeds it bytes after checking that the buffer starts with `M` and `T` (see below).
+- **The end-of-frame state has no code.** The enum has `EN_FRM_EOF`, but the `switch` has no case for it. That fits the idea that the trailer byte is dropped by the caller before it ever reaches the machine.
+
+## HWMsg_t, the message struct
+
+Once a frame passes its checks, the app does not keep it as bytes. It copies the fields into a small struct that lives in the same header:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.hpp" line={52} expect="struct HWMsg_t">
+
+```cpp
+struct HWMsg_t
+```
+
+</CodeRef>
+
+Four members:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.hpp" line={54} expect="pktType{">
+
+```cpp
+enumPacketType   pktType{ enumPacketType::EN_PKT_TYPE_BUTTON };
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.hpp" line={55} expect="pktDir{">
+
+```cpp
+enumPacketDir    pktDir{ enumPacketDir::EN_PKT_REQUEST };
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.hpp" line={56} expect="int              pktCmd{ 0 };">
+
+```cpp
+int              pktCmd{ 0 };
+```
+
+</CodeRef>
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.hpp" line={57} expect=" data;">
+
+```cpp
+std::vector<int> data;
+```
+
+</CodeRef>
+
+The type, the direction and the command are the three header fields from the frame. `data` is the payload, widened from bytes to ints. It is the same shape in both directions: the sender fills one and `BuildAndTransmitPacket` turns it into bytes, and the reader builds one from bytes. Squeezing an `int` into one wire byte keeps only the low 8 bits (general C++ behavior when you push an int into a vector of chars), so a value above 255 would silently wrap.
+
+It is the common currency of the program. The type is mentioned in 151 files at the pinned commit (`git grep -l "HWMsg_t"`). Every signal that carries a hardware event carries it by reference:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_signals.h" line={46} expect="hardwareInputTriggered;">
+
+```cpp
+static sigslot::signal<CPktMgr::HWMsg_t&>               hardwareInputTriggered;
+```
+
+</CodeRef>
+
+The default message type is BUTTON, so a message you forget to fill in looks like a button message. That default is harmless to read but easy to trip on.
+
+Code that handles a message does not index into `data` by hand. It goes through a layer of small named predicates and getters in `DclContractsHelper`, so the meaning of "data byte 1" lives in one place:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts_helper.cpp" line={79} expect="getButtonState">
+
+```cpp
+int DclContractsHelper::getButtonState( const CPktMgr::HWMsg_t& hwMsg ) { return hwMsg.data[1]; }
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts_helper.cpp" line={88} expect="getKnobRotation">
+
+```cpp
+int DclContractsHelper::getKnobRotation( const CPktMgr::HWMsg_t& hwMsg ) { return hwMsg.data[2]; }
+```
+
+</CodeRef>
+
+A button message carries a button code and a state. A knob message carries a knob code, a direction and a rotation amount. A slider carries one value. The pad message you saw carries four.
+
+## Who reads the port: the threads
+
+All of the serial handling lives in one class inside `input_events.cpp`. Its declaration shows three jobs in one:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={28} expect="class HwSerialData : private juce::ChangeListener">
+
+```cpp
+class HwSerialData : private juce::ChangeListener
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={29} expect=", private juce::Thread">
+
+```cpp
+, private juce::Thread
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={30} expect=", private juce::AsyncUpdater">
+
+```cpp
+, private juce::AsyncUpdater
+```
+
+</CodeRef>
+
+It is a `ChangeListener` so the port can tell it that bytes arrived. It is a `Thread` so it can run a worker of its own. It is an `AsyncUpdater` so any thread can ask for a callback on the message thread. The constructor starts the thread and names it "Queue":
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={34} expect="startThread();">
+
+```cpp
+: Thread( "Queue" ) { startThread(); }
+```
+
+</CodeRef>
+
+When the port opens, the class registers itself for change messages from the input stream and asks to be told every time:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={81} expect="addChangeListener( this );">
+
+```cpp
+input->addChangeListener( this );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={82} expect="NOTIFY_ALWAYS">
+
+```cpp
+input->setNotify( SerialPortInputStream::NOTIFY_ALWAYS );
+```
+
+</CodeRef>
+
+### The receive side: one callback, on the message thread
+
+When bytes land, JUCE calls `changeListenerCallback`:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={155} expect="void changeListenerCallback(">
+
+```cpp
+void changeListenerCallback( juce::ChangeBroadcaster* source ) override
+```
+
+</CodeRef>
+
+Which thread is that? JUCE delivers change-listener callbacks asynchronously on the message thread. That is general knowledge about `juce::ChangeBroadcaster`, not something this repository proves. Two things in the repository agree with it. The callback calls straight into UI code with no `callAsync` wrapper (Module 4's tool for hopping to the message thread), and `KickHome::handleCommand` calls `ae.setBank` and `sigScreenClose` directly. What I could not check is how the serial stream raises its change message in the first place. That code is `juce_serialport`, which is not in the tree (Module 0 explained why).
+
+So the working assumption for this lesson is: the whole receive path, from the callback to the engine call, runs on the message thread. Not verified on hardware.
+
+The callback does five things. First, it bails out if fewer than 6 bytes are waiting. Six is the length of the header up to the size byte, and a real frame is at least 7:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={159} expect="getTotalLength() < 6">
+
+```cpp
+if( !input->getTotalLength() || input->getTotalLength() < 6 )
+```
+
+</CodeRef>
+
+Second, it reads everything the port has into one buffer:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={165} expect="read( serialData.getData()">
+
+```cpp
+input->read( serialData.getData(), (int)input->getTotalLength() );
+```
+
+</CodeRef>
+
+Third, it loops over the buffer. For each frame it checks that enough bytes are left and that the first two are `M` and `T` (the length expression was explained above):
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={184} expect="byteArray[0] == 'M'">
+
+```cpp
+if( ( rxLength >= packetLength ) && ( byteArray[0] == 'M' ) && ( byteArray[1] == 'T' ) )
+```
+
+</CodeRef>
+
+Fourth, it feeds the frame to the state machine one byte at a time:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={190} expect="refobjFrameHdl.PushByteToRxFifo( byteArray[0] );">
+
+```cpp
+refobjFrameHdl.PushByteToRxFifo( byteArray[0] );
+```
+
+</CodeRef>
+
+Fifth, if the machine raised its flag, the callback builds an `HWMsg_t`. The three header fields come from getters:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={208} expect="rxMsg.pktType = refobjFrameHdl.GetRxPktType();">
+
+```cpp
+rxMsg.pktType = refobjFrameHdl.GetRxPktType();
+```
+
+</CodeRef>
+
+The data comes out of the FIFO, one pop per data byte. The loop runs while `size - 1` is non-zero, counting `size` down:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={220} expect="while( size - 1 )">
+
+```cpp
+while( size - 1 )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={222} expect="rxMsg.data.push_back( (int)refobjFrameHdl.PopUint8FromRxFifo() );">
+
+```cpp
+rxMsg.data.push_back( (int)refobjFrameHdl.PopUint8FromRxFifo() );
+```
+
+</CodeRef>
+
+Then it resets the state machine:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={226} expect="refobjFrameHdl.ClearReceiver();">
+
+```cpp
+refobjFrameHdl.ClearReceiver();
+```
+
+</CodeRef>
+
+Only messages whose direction is "request" are forwarded. "Response" messages from the MCU are ignored, and the code says so in a comment:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={229} expect="if( rxMsg.pktDir == CPktMgr::enumPacketDir::EN_PKT_REQUEST )">
+
+```cpp
+if( rxMsg.pktDir == CPktMgr::enumPacketDir::EN_PKT_REQUEST )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={253} expect="//If the data is Ack (response) for the App message, ignore">
+
+```cpp
+//If the data is Ack (response) for the App message, ignore
+```
+
+</CodeRef>
+
+The app does not acknowledge what it receives either. The lines that would send an ack are commented out (lines 231 to 238). The protocol has the direction bit, but the app does not use it for acks.
+
+Last step. The callback fires one signal with the message:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={125} expect="Controls::InputEvents::dispatchHardwareEvent( f_rxMsg );">
+
+```cpp
+Controls::InputEvents::dispatchHardwareEvent( f_rxMsg );
+```
+
+</CodeRef>
+
+### How the message gets from the signal to the screens
+
+`dispatchHardwareEvent` is a signal, the same observer pattern Module 4 described. In the monolith, one slot is connected to it by `KickDeviceAdapter`, which `initialise` creates in Module 4's startup walk:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={134} expect="adapter.reset( new KickDeviceAdapter() );">
+
+```cpp
+adapter.reset( new KickDeviceAdapter() );
+```
+
+</CodeRef>
+
+The adapter's constructor opens the port, then connects its handler. The handler re-fires the message on a second signal:
+
+<CodeRef path="Kick/apps/kick/kick_device_adapter.h" line={37} expect="Controls::InputEvents::initialize();">
+
+```cpp
+Controls::InputEvents::initialize();
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/apps/kick/kick_device_adapter.h" line={39} expect="contracts::DclSignals::hardwareInputTriggered( f_HwMsg );">
+
+```cpp
+contracts::DclSignals::hardwareInputTriggered( f_HwMsg );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/apps/kick/kick_device_adapter.h" line={42} expect="Controls::InputEvents::dispatchHardwareEvent.connect( handler );">
+
+```cpp
+Controls::InputEvents::dispatchHardwareEvent.connect( handler );
+```
+
+</CodeRef>
+
+Why two signals in a row? The first is the transport's output. The second, `hardwareInputTriggered`, is the app's input. Putting the adapter between them means the UI code never mentions the serial module. The same second signal also has other sources. The desktop keyboard stand-in feeds the same handler, which you will meet later:
+
+<CodeRef path="Kick/apps/kick/kick_device_adapter.h" line={44} expect="KeyboardEventTriggered.connect( handler );">
+
+```cpp
+contracts::KeyboardSignals::KeyboardEventTriggered.connect( handler );
+```
+
+</CodeRef>
+
+On the receiving end, `KickHome` connects its own handler when it is built:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={173} expect="contracts::DclSignals::hardwareInputTriggered.connect(">
+
+```cpp
+contracts::DclSignals::hardwareInputTriggered.connect( [&]( CPktMgr::HWMsg_t& f_HwMsg ) {
+```
+
+</CodeRef>
+
+`handleCommand` is a long function, and it is the router for the whole device. System messages are checked first, ahead of anything else:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={343} expect="isSystemMessage( f_HwMsg )">
+
+```cpp
+if( contracts::DclContractsHelper::isSystemMessage( f_HwMsg ) )
+```
+
+</CodeRef>
+
+Everything else is held back until a project is loaded and not loading:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={377} expect="else if( prjLoaded && !ui::RecentProject::isProjectLoading )">
+
+```cpp
+else if( prjLoaded && !ui::RecentProject::isProjectLoading )
+```
+
+</CodeRef>
+
+So with no project loaded, a pad press is dropped here. Inside that branch, global buttons are handled first. A button press with a known code opens a screen by firing the screen signal from Module 4. For example, the Sampler button:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={402} expect="EN_SAMPLER: signals::sigScreenClose( Screen::MenuSampler )">
+
+```cpp
+case contracts::DeviceControlContracts::EN_SAMPLER: signals::sigScreenClose( Screen::MenuSampler ); break;
+```
+
+</CodeRef>
+
+Pads are not a global concern. They fall through to the current screen. First `KickHome` excludes pads from the focused-component path:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={459} expect="!contracts::DclContractsHelper::isPadButtonMessage( f_HwMsg )">
+
+```cpp
+if( contracts::DclContractsHelper::isNavigationMessage( f_HwMsg ) && ui::getComponentInFocus() && !contracts::DclContractsHelper::isPadButtonMessage( f_HwMsg ) )
+```
+
+</CodeRef>
+
+Then it asks the current screen whether it wants raw hardware commands, and if so hands the message over:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={466} expect="requiresHandleCommand()">
+
+```cpp
+else if( getScreen( getCurrentScreen() )->requiresHandleCommand() )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={470} expect="handleCommand( f_HwMsg );">
+
+```cpp
+getScreen( getCurrentScreen() )->handleCommand( f_HwMsg );
+```
+
+</CodeRef>
+
+Both hooks come from the base class you met in Module 4. The default says "no, I do not want commands":
+
+<CodeRef path="Kick/modules/kick_ui_common/source/kick_IScreen.h" line={100} expect="virtual bool requiresHandleCommand() { return false; }">
+
+```cpp
+virtual bool requiresHandleCommand() { return false; }
+```
+
+</CodeRef>
+
+The pad-performance screen opts in:
+
+<CodeRef path="Kick/modules/kick_ui/modes/padperform/kick_PadPerform.h" line={144} expect="bool requiresHandleCommand() override { return true; }">
+
+```cpp
+bool requiresHandleCommand() override { return true; }
+```
+
+</CodeRef>
+
+### The last hop: pad to note
+
+Here is the screen's handler. A pad message is turned into a MIDI note on, using the velocity from the frame:
+
+<CodeRef path="Kick/modules/kick_ui/modes/padperform/kick_PadPerform.cpp" line={57} expect="juce::MidiMessage::noteOn( 1, it, (juce::uint8)velocity )">
+
+```cpp
+Msg = juce::MidiMessage::noteOn( 1, it, (juce::uint8)velocity );
+```
+
+</CodeRef>
+
+Then it hands the MIDI message to the engine for the selected track:
+
+<CodeRef path="Kick/modules/kick_ui/modes/padperform/kick_PadPerform.cpp" line={61} expect="ae.addLiveMidiMsg( ae.getSelected(), Msg );">
+
+```cpp
+ae.addLiveMidiMsg( ae.getSelected(), Msg );
+```
+
+</CodeRef>
+
+The engine routes it to the track:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_interface.cpp" line={1750} expect="processIncomingMidiMessage( Msg );">
+
+```cpp
+t->processIncomingMidiMessage( Msg );
+```
+
+</CodeRef>
+
+The track applies its note and velocity rules, then passes the message to the program:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp" line={404} expect="noteProcess( list );">
+
+```cpp
+pProgram->noteProcess( list );
+```
+
+</CodeRef>
+
+And the program starts the note:
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_iprogram.cpp" line={282} expect="noteOn( noteNo, midiLevel );">
+
+```cpp
+noteOn( noteNo, midiLevel );
+```
+
+</CodeRef>
+
+That is where this lesson stops. From `noteOn` onward the work is about voices and buffers, and Modules 6 and 7 pick it up.
+
+## The way back: LEDs
+
+The outbound path is the longer one, because it is built for callers on any thread.
+
+An LED change starts as an app event. `KickLEDs` is an object built by `KickHome`, and it listens to signals:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={197} expect="ledControl_ = std::make_unique">
+
+```cpp
+ledControl_ = std::make_unique<KickLEDs>();
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_leds/kick_leds.cpp" line={54} expect="mt::signals::playStateChanged.connect(">
+
+```cpp
+mt::signals::playStateChanged.connect( [&]( mt::TransportState State ) {
+```
+
+</CodeRef>
+
+The handler you saw in Example 1 builds the message with `setMediaControlMessage`. Notice what that function returns. It is not an `HWMsg_t`. It is a JSON message:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts_helper.cpp" line={284} expect="constructRequestMessage( contracts::DclIPCMessageType::DCL_IPC_MESSAGE_TYPE_HW_COMMAND )">
+
+```cpp
+ipc::MTIPCMessageConstructor::constructRequestMessage( contracts::DclIPCMessageType::DCL_IPC_MESSAGE_TYPE_HW_COMMAND );
+```
+
+</CodeRef>
+
+That is the contracts layer from Module 4's monolith-versus-processes discussion. The same JSON shape can travel over IPC in the multi-process build. In the monolith the JSON stays in-process, and the adapter unpacks it again. That is my reading of why the detour exists. The cost is a little allocation and copying per LED update.
+
+The signal that carries it is `sendCommandToDcl`:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_signals.h" line={44} expect="sendCommandToDcl;">
+
+```cpp
+static sigslot::signal<std::shared_ptr<ipc::MTIPCJson>> sendCommandToDcl;
+```
+
+</CodeRef>
+
+A signal calls its connected functions directly, on the thread that fires it. That is general knowledge about signal/slot libraries; I did not read this one's source. It is why the first four boxes in the outbound picture say "caller's thread". The adapter connects to the signal, converts the JSON back into an `HWMsg_t`, and forwards it:
+
+<CodeRef path="Kick/apps/kick/kick_device_adapter.h" line={59} expect="ipcMessageToHWMessage( message, msg );">
+
+```cpp
+contracts::DclContractsHelper::ipcMessageToHWMessage( message, msg );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/apps/kick/kick_device_adapter.h" line={71} expect="Controls::InputEvents::sendMessageToHardware( msg );">
+
+```cpp
+Controls::InputEvents::sendMessageToHardware( msg );
+```
+
+</CodeRef>
+
+`sendMessageToHardware` has a short gate before the queue. Two system commands never reach the wire. They are handled locally, as a reconnect and a shutdown of the port object:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={346} expect="EN_SYS_RECONNECT">
+
+```cpp
+if( f_HwMsg.pktCmd == contracts::DeviceControlContracts::EN_SYS_RECONNECT )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={351} expect="EN_SYS_SHUTDOWN">
+
+```cpp
+if( f_HwMsg.pktCmd == contracts::DeviceControlContracts::EN_SYS_SHUTDOWN )
+```
+
+</CodeRef>
+
+Everything else goes to the port object, or is logged and dropped if the port is not open:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={361} expect="sendMessageToControlSurface( f_HwMsg );">
+
+```cpp
+if( _FPPort ) _FPPort->sendMessageToControlSurface( f_HwMsg );
+```
+
+</CodeRef>
+
+### The hop to the "Queue" thread
+
+`sendMessageToControlSurface` does not write to the port. It puts the message in a queue and pokes an async updater:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={114} expect="txQueue.enqueue( f_HwMsg );">
+
+```cpp
+txQueue.enqueue( f_HwMsg );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={116} expect="triggerAsyncUpdate();">
+
+```cpp
+triggerAsyncUpdate();
+```
+
+</CodeRef>
+
+The queue is a lock-free multi-producer queue from the `moodycamel` library, so any thread can enqueue without waiting on a lock:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={296} expect="moodycamel::ConcurrentQueue">
+
+```cpp
+moodycamel::ConcurrentQueue<CPktMgr::HWMsg_t> txQueue;
+```
+
+</CodeRef>
+
+The async update is a wake-up call. When JUCE runs it (on the message thread, general JUCE knowledge), all it does is signal an event:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={129} expect="void handleAsyncUpdate() override { txEvent.signal(); }">
+
+```cpp
+void handleAsyncUpdate() override { txEvent.signal(); }
+```
+
+</CodeRef>
+
+The "Queue" thread sleeps on that event. It wakes when signalled, or after one second if nobody signals:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={273} expect="txEvent.wait( 1000 );">
+
+```cpp
+txEvent.wait( 1000 );
+```
+
+</CodeRef>
+
+Then it drains the queue. For each message it builds the frame and writes it:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={276} expect="txQueue.try_dequeue( item )">
+
+```cpp
+while( txQueue.try_dequeue( item ) && !threadShouldExit() )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={280} expect="ms_objPktMgrUsb.BuildAndTransmitPacket( item, txData );">
+
+```cpp
+ms_objPktMgrUsb.BuildAndTransmitPacket( item, txData );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={149} expect="write( outData.getData(), outData.getSize() );">
+
+```cpp
+output->write( outData.getData(), outData.getSize() );
+```
+
+</CodeRef>
+
+`BuildAndTransmitPacket` is the function you read in the frame section. Despite its name it does not transmit anything itself. It only fills the byte vector. The write happens here.
+
+### Thread map
+
+| Thread | What runs on it | Source |
+|---|---|---|
+| Serial stream internals | Raises the change message when bytes arrive | `juce_serialport`, not in the tree. Not read |
+| Message thread | The serial callback, the state machine, `handleCommand`, the screens, the engine call | `input_events.cpp:155` and the lines above. Message-thread delivery is general JUCE knowledge |
+| Any caller's thread | Builds the JSON, forwards it, enqueues | `kick_leds.cpp`, `kick_device_adapter.h`, `input_events.cpp:114` |
+| "Queue" thread | Dequeues, builds the frame, writes the port | `input_events.cpp:267` |
+
+<Aside type="caution" title="My reading, not run on hardware">
+The inbound path runs entirely on the message thread. The cost is the Module 4 rule in a new place. A slow screen handler delays the next read of the serial port, because the same thread does both. What the UART driver does with bytes that arrive during that delay depends on its buffer size, which this repository does not show.
+</Aside>
+
+Every inbound message is also logged twice on the way up, once in the serial class and once at the top of `handleCommand`. I did not measure what that costs.
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={123} expect="juce::Logger::writeToLog( log );">
+
+```cpp
+juce::Logger::writeToLog( log );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={341} expect="juce::Logger::writeToLog( log );">
+
+```cpp
+juce::Logger::writeToLog( log );
+```
+
+</CodeRef>
+
+## When things go wrong
+
+This is the part with the fewest guard rails. I read each failure path. Where I ran the packet class on my Mac to confirm, I say so.
+
+| Situation | What the code does | Where |
+|---|---|---|
+| Fewer than 6 bytes in a read | Returns before reading. What the stream does with the unread bytes is inside `juce_serialport`, which I did not read | `input_events.cpp:159` |
+| A frame does not start with `M` `T` | Sets the remaining length to 0, so everything left in that read is thrown away. There is no search for the next `M` | `input_events.cpp:184`, `:199` |
+| A frame is cut off at the end of a read | Same branch as above. The partial frame is dropped, and its tail is not kept for the next read | `input_events.cpp:184` |
+| CRC mismatch | The CRC state clears its scratch buffer and the flag stays false. The caller sees "not complete", clears the receiver, and drops the frame. The only trace is a debug print, and only if `DEBUG_PRINTS` is set | `PktMgr.cpp:101`, `input_events.cpp:259` to `:262` |
+| Several frames in one read | The loop moves to the next frame. A bad one costs only itself | `input_events.cpp:177` |
+| Port missing at startup | Does nothing except a `DBG` print, which is a debug-build feature (general JUCE knowledge). No retry loop that I found | `input_events.cpp:92` |
+| Send while the port is closed | The write function returns early. The sender sees nothing | `input_events.cpp:133` |
+
+Let me expand on the first two rows, because they are the heart of "lost sync". In many serial protocols, if you land in the middle of a frame you scan forward until you see the start stamp again. This reader does not do that. It trusts that every read begins at a frame boundary. If one byte is lost or one extra byte arrives, the rest of that read is gone. The next read gets a fresh chance, but only if it happens to start cleanly. The leading `M` `T` and the CRC are what keep garbage from being accepted, not what let the reader recover.
+
+Here are the lines for the first two:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={199} expect="rxLength = 0;">
+
+```cpp
+rxLength = 0;
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={262} expect="refobjFrameHdl.ClearReceiver();">
+
+```cpp
+refobjFrameHdl.ClearReceiver();
+```
+
+</CodeRef>
+
+And the message you would see for a bad frame, if debug prints were on:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={260} expect="Data Frame Error">
+
+```cpp
+DBG( "Data Frame Error" );
+```
+
+</CodeRef>
+
+There is no negative acknowledgment to the MCU, no counter, and no log in a normal build. A bad frame just vanishes. If a pad press is lost this way, the MCU cannot know.
+
+<Aside type="caution" title="Edge cases I noticed, not run in the app">
+Two sizes the state machine does not handle cleanly. I tested the first one on the desktop with the scratch build of the packet class alone.
+
+**Size 1, meaning zero data bytes.** `BuildAndTransmitPacket` writes size 1 for a message with no data. The reader's DATA state only advances while the write position is below size minus 1, which is below 0. It never advances, so the CRC byte is swallowed as data and the flag never sets. In my scratch test, that frame was not accepted, and the next good frame after it was also rejected, because the shared scratch buffer still held the stale bytes. The frame after that was accepted. So one extra frame is lost. The app's reader would then take its "frame error" branch and reset the state machine, but it would not clear the scratch buffer.
+
+**Size 0.** The state machine jumps straight to the CRC state (line 79). The callback's pop loop is `while( size - 1 )`, which does not stop at 0. I did not run this case in the app, so I will not predict what happens.
+
+Both need an MCU that sends those sizes, and the app's own commands always carry data. Keep the data count at one or more if you add a packet type.
+</Aside>
+
+One more limit to know before you add a packet. The receive buffer handed to the packet class is 20 bytes:
+
+<CodeRef path="Kick/modules/input_events/ComConfig.hpp" line={6} expect="#define BUFFER_RX_SIZE 20">
+
+```cpp
+#define BUFFER_RX_SIZE 20
+```
+
+</CodeRef>
+
+The DATA state checks the position against the frame's size field. I did not find a check against that 20-byte buffer. So keep inbound frames small, well under 20 data bytes. Outbound frames have no such buffer. The send side builds a vector, so a long message such as setting all pad colours is fine on the way out.
+
+## The handshake
+
+When the app opens the port it says hello, and later the MCU and the app exchange two small system messages. This is all SYSTEM-type packets, type 0.
+
+**Step 1: the app says it is connected.** Right after it opens the port, `connect()` builds a SYSTEM request with the `EN_SYS_COMM_INIT` command:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={76} expect="EN_SYS_COMM_INIT;">
+
+```cpp
+hwMsg.pktCmd  = contracts::DeviceControlContracts::SysCmd::EN_SYS_COMM_INIT;
+```
+
+</CodeRef>
+
+The one data value is "connected":
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={84} expect="EN_SYS_COMM_CONNECTED">
+
+```cpp
+hwMsg.data.push_back( (int)contracts::DeviceControlContracts::SysCommCmd::EN_SYS_COMM_CONNECTED );
+```
+
+</CodeRef>
+
+And it sends the message through the same queue everything else uses:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={86} expect="Controls::InputEvents::sendMessageToHardware( hwMsg );">
+
+```cpp
+Controls::InputEvents::sendMessageToHardware( hwMsg );
+```
+
+</CodeRef>
+
+The two enums involved are separate. `SysCmd` lists the commands. `SysCommCmd` lists the connection states, with "not connected" as 0 and "connected" as 1:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts.h" line={86} expect="EN_SYS_COMM_CONNECTED">
+
+```cpp
+EN_SYS_COMM_CONNECTED
+```
+
+</CodeRef>
+
+**Step 2: the app answers an "init" from the MCU.** The app has a predicate for an incoming SYSTEM message whose command is `EN_SYS_CHECK_COMM_STATUS` and whose first data value is 1:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts_helper.cpp" line={70} expect="data[0] == 1">
+
+```cpp
+bool DclContractsHelper::isSystemCommInit( const CPktMgr::HWMsg_t& hwMsg ) { return ( hwMsg.pktType == CPktMgr::enumPacketType::EN_PKT_TYPE_SYSTEM ) && ( hwMsg.pktCmd == contracts::DeviceControlContracts::SysCmd::EN_SYS_CHECK_COMM_STATUS ) && ( hwMsg.data[0] == 1 ); }
+```
+
+</CodeRef>
+
+When `KickHome` sees one, it replies with a SYSTEM request carrying `EN_SYS_COMM_INIT`:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={350} expect="isSystemCommInit( f_HwMsg )">
+
+```cpp
+if( contracts::DclContractsHelper::isSystemCommInit( f_HwMsg ) )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={355} expect="SysCmd::EN_SYS_COMM_INIT;">
+
+```cpp
+sendMsg.pktCmd  = contracts::DeviceControlContracts::SysCmd::EN_SYS_COMM_INIT;
+```
+
+</CodeRef>
+
+The data byte in the reply is the number 2. It is written as `EN_SYS_COMM_INIT`, which is the third entry in the `SysCmd` enum, not as a connection state:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={358} expect="data.push_back( (int)contracts::DeviceControlContracts::SysCmd::EN_SYS_COMM_INIT );">
+
+```cpp
+sendMsg.data.push_back( (int)contracts::DeviceControlContracts::SysCmd::EN_SYS_COMM_INIT );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts.h" line={75} expect="EN_SYS_COMM_INIT,">
+
+```cpp
+EN_SYS_COMM_INIT,
+```
+
+</CodeRef>
+
+The enum starts at 0 (`EN_SYS_RESET_GD`), so `EN_SYS_GET_SW_VER` is 1 and `EN_SYS_COMM_INIT` is 2. A person reading the code would expect a `SysCommCmd` value there. The value it sends is 2, and I cannot tell from this repository whether the MCU treats it by number or by name, or whether the mix of the two enums is deliberate.
+
+**Step 3: the app answers a "live" check.** A second predicate matches the same command with first data value 2:
+
+<CodeRef path="Kick/modules/contracts/dcl/dcl_contracts_helper.cpp" line={71} expect="data[0] == 2">
+
+```cpp
+bool DclContractsHelper::isSystemCommLive( const CPktMgr::HWMsg_t& hwMsg ) { return ( hwMsg.pktType == CPktMgr::enumPacketType::EN_PKT_TYPE_SYSTEM ) && ( hwMsg.pktCmd == contracts::DeviceControlContracts::SysCmd::EN_SYS_CHECK_COMM_STATUS ) && ( hwMsg.data[0] == 2 ); }
+```
+
+</CodeRef>
+
+The reply echoes the same command with data 2:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={371} expect="sendMsg.data.push_back( 2 );">
+
+```cpp
+sendMsg.data.push_back( 2 );
+```
+
+</CodeRef>
+
+The reply goes out through `createAndSendCommandToDcl`, which is the second outbound signal, the one that takes an `HWMsg_t` directly with no JSON:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={359} expect="createAndSendCommandToDcl( sendMsg );">
+
+```cpp
+contracts::DclSignals::createAndSendCommandToDcl( sendMsg );
+```
+
+</CodeRef>
+
+My reading of the whole exchange. The MCU boots, sends an "init" with data 1, the app replies with its own init, and from then on the MCU can send "live" pings with data 2 that the app echoes back. The names `isSystemCommInit` and `isSystemCommLive` suggest that, but the MCU side is not here, so the sequence, timing and what the MCU does on a missing reply are all unverified. One piece I can confirm is that these messages sit ahead of the "project loaded" gate, so the handshake works even with no project open (line 343 comes before line 377).
+
+SYSTEM messages carry other things too. For example, a software-version report is stored for display:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={347} expect="setSurfaceVersion(">
+
+```cpp
+mt::HwPref::getHwPref().setSurfaceVersion( juce::String( f_HwMsg.data[0] ) + "." + juce::String( f_HwMsg.data[1] ) );
+```
+
+</CodeRef>
+
+## Why it is built this way
+
+**A tiny, shared packet class.** `PktMgr` has no dependencies and compiles on the MCU as well as on Linux. The README says so:
+
+<CodeRef path="ComProtocol/README.md" line={4} expect="no external dependencies">
+
+```text
+and the device hardware over USB. It is a small C++ class with no external dependencies.
+```
+
+</CodeRef>
+
+The benefit is that both sides agree on the framing because they run the same code. The cost is that the class is written for a small chip: fixed buffers, a single static scratch vector, and no help for the caller when something goes wrong.
+
+**One thread handles input end to end.** There is no queue between the serial callback and the screens. The benefit is simplicity and ordering: events reach the UI in the order the bytes arrived, and no screen needs a lock. The cost, as noted, is that slow UI work delays port reads.
+
+**A dedicated send thread.** The message thread must never block (Module 4). Writing to a port can block. So sends go through a queue to a thread whose only job is to wait and write. The benefit is that LED updates from any thread are safe and cheap to issue. The cost is a wake-up delay before each write, and a queue where I did not see a cap on its length.
+
+**A JSON detour in a monolith.** It keeps one command format for the single-process and multi-process builds. It costs extra copying in the single-process one.
+
+## Customization pointers
+
+Everything below is a description of what the code shows. I did not build any of it on a device.
+
+### Add a new packet type
+
+1. **The type enum.** Add a name at the end of `enumPacketType`, after `EN_PKT_TYPE_SLIDER`. Do not reorder or insert in the middle: the numbers are the wire values, and the MCU has its own copy.
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.hpp" line={43} expect="EN_PKT_TYPE_SLIDER,">
+
+```cpp
+EN_PKT_TYPE_SLIDER,
+```
+
+</CodeRef>
+
+2. **The command enum.** Add a command list in `dcl_contracts.h`, next to `LedCmd`, `PadCmd` and `SliderCmd`.
+3. **A builder and a predicate.** In `DclContractsHelper`, add a builder that calls `prepareHWMessage` (for outbound) and a predicate like `isPadButtonMessage` (for inbound).
+4. **A handler.** For a global effect, add a branch in `KickHome::handleCommand`. For a screen-specific effect, override `handleCommand` in the screen and make `requiresHandleCommand` return true.
+5. **The MCU.** The firmware has to send or understand the new type. That part is outside this repository.
+
+### Write a stand-in for the MCU, to test the app on a desktop
+
+I describe three options. None of them is tested in the app.
+
+**Option A: skip the wire.** Build an `HWMsg_t` yourself and call `contracts::DclSignals::hardwareInputTriggered( msg )`. That is exactly what the repository's own keyboard stand-in does. It maps keys to button and pad messages, and fills the same fields:
+
+<CodeRef path="Kick/modules/contracts/utils/keyboard/keyboard_detector.cpp" line={51} expect="{ 'Z', { contracts::DeviceControlContracts::EN_PAD1, true, CPktMgr::EN_PKT_TYPE_PAD } },">
+
+```cpp
+{ 'Z', { contracts::DeviceControlContracts::EN_PAD1, true, CPktMgr::EN_PKT_TYPE_PAD } },
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/contracts/utils/keyboard/keyboard_detector.cpp" line={118} expect="CPktMgr::HWMsg_t hwMsg;">
+
+```cpp
+CPktMgr::HWMsg_t hwMsg;
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/contracts/utils/keyboard/keyboard_detector.cpp" line={145} expect="// Random Velocity">
+
+```cpp
+hwMsg.data.push_back( ( juce::int8 )( 80 ) ); // Random Velocity
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/contracts/utils/keyboard/keyboard_detector.cpp" line={148} expect="contracts::KeyboardSignals::KeyboardEventTriggered( hwMsg );">
+
+```cpp
+contracts::KeyboardSignals::KeyboardEventTriggered( hwMsg );
+```
+
+</CodeRef>
+
+The map is only compiled on Windows:
+
+<CodeRef path="Kick/modules/contracts/utils/keyboard/keyboard_detector.cpp" line={31} expect="#if defined( _WIN32 ) || defined( _WIN64 )">
+
+```cpp
+#if defined( _WIN32 ) || defined( _WIN64 )
+```
+
+</CodeRef>
+
+So on a Mac or Linux desktop you would write your own source of fake events, following the same recipe. The recipe is: fill type, command and data, then fire the signal from the message thread.
+
+**Option B: fake the wire.** Write a small program that pretends to be the MCU: it builds frames with the CRC routine from this lesson and writes them to a pseudo-terminal that the app opens in place of `/dev/ttymxc0`. Three things stand in the way. The path is hard-coded. The whole `connect()` is Linux-only. And the serial class is missing from the tree. So this option needs a Linux desktop and a replacement serial module first. I have not tried it.
+
+**Option C: test the packet class alone.** `PktMgr.cpp` includes only its own header, and that header pulls in `Defines.hpp`, the standard library and nothing from JUCE:
+
+<CodeRef path="ComProtocol/PktMgr/PktMgr.hpp" line={1} expect="Defines.hpp">
+
+```cpp
+#include "Defines.hpp"
+```
+
+</CodeRef>
+
+ That is how I built it on my Mac to check the frames in this lesson. A short test that builds the two example frames, feeds them back in, and flips one bit to confirm a rejection is a good first step before you touch the app. The size-1 case above is a test worth writing too.
+
+There is also a simulator branch in `input_events.cpp`, guarded by `SIM_BUILD`. I would not rely on it. It calls the dispatch signal with an integer and a byte vector, but the signal is declared to take an `HWMsg_t`:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={312} expect="Controls::InputEvents::dispatchHardwareEvent( id, data );">
+
+```cpp
+Controls::InputEvents::dispatchHardwareEvent( id, data );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.h" line={65} expect="dispatchHardwareEvent;">
+
+```cpp
+static sigslot::signal<CPktMgr::HWMsg_t&> dispatchHardwareEvent;
+```
+
+</CodeRef>
+
+Those two lines disagree, so I read that branch as stale. I did not try to compile it.
+
+## Try it yourself
+
+Work with the upstream clone at the pinned commit. Do the grep tour first.
+
+```bash
+# 1. How many files mention the message struct?
+git grep -l "HWMsg_t" | wc -l
+# 2. Where is each packet type compared?
+git grep -n "EN_PKT_TYPE_PAD"
+# 3. Who connects to the signal the serial callback fires?
+git grep -n "dispatchHardwareEvent"
+# 4. Who fires the signal the screens listen to?
+git grep -n "hardwareInputTriggered"
+```
+
+Then trace one packet type end to end. Pick `EN_PKT_TYPE_PAD`. Write down the file and line for each hop:
+
+1. The line that defines the type and its number.
+2. The line in the state machine that stores the type from an incoming frame.
+3. The line in the serial callback that copies it into an `HWMsg_t`.
+4. The line that fires `dispatchHardwareEvent`.
+5. The line in `KickDeviceAdapter` that re-fires it as `hardwareInputTriggered`.
+6. The lines in `KickHome` where the handler is connected and where `handleCommand` starts.
+7. The predicate that recognises a pad message.
+8. The screen handler that reads the pad number, state and velocity.
+9. The engine function the handler calls.
+
+For each hop, also write down which thread you believe runs it, and whether you proved that from the code or are relying on general JUCE knowledge.
+
+Two extras. First, take the pad frame from this lesson and change the pad number from 02 to 05. Work out the new CRC by hand, using the running table method. Second, look at `setPadDataMessage` in `dcl_contracts_helper.cpp`. It builds a PAD message with command `EN_PAD_SET_SINGLE_PAD` and three data values. Write out the frame it would produce for pad 2, state on, colour 15: the size byte, the data bytes, and the header. Then work out the CRC with the running table. Compare your result with a classmate's, or run the loop in a scratch program.
+
+## Check yourself
+
+<Quiz
+  items={[
+    {
+      q: 'A message has 3 data bytes. What is the value of the size byte in its frame?',
+      options: [
+        '3',
+        '4, because the size counts the data bytes plus the CRC byte',
+        '7, because the header is 7 bytes long',
+        '10, because that is the whole frame length',
+      ],
+      answer: 1,
+      why: 'BuildAndTransmitPacket pushes the data count plus PKTMGR_CRC_BYTE. The receiver collects size minus 1 data bytes and then reads the CRC.',
+    },
+    {
+      q: 'Which bytes does the CRC cover?',
+      options: [
+        'Only the data bytes',
+        'The type and the command',
+        'Every byte from the M through the last data byte, but not the CRC byte itself',
+        'Every byte of the frame including the trailer',
+      ],
+      answer: 2,
+      why: 'CrcGen runs over the whole scratch buffer, which starts with M and ends with the last data byte. The CRC state compares the result with the incoming CRC byte and does not add that byte to the buffer.',
+    },
+    {
+      q: 'The CRC of an incoming frame does not match. What does the app do?',
+      options: [
+        'Sends a negative acknowledgment so the MCU resends',
+        'Stops reading the port until it is reset',
+        'Drops the frame, resets the receiver and carries on with the next frame in the read, with no trace in a normal build',
+        'Passes the frame to the screens anyway and logs a warning',
+      ],
+      answer: 2,
+      why: 'The flag stays false, so the callback takes its frame-error branch and clears the receiver. The debug print is only compiled in when DEBUG_PRINTS is set, and the app never sends acks.',
+    },
+    {
+      q: 'Which thread builds the outgoing frame and writes it to the port?',
+      options: [
+        'The message thread, inside sendMessageToHardware',
+        'The audio thread, so LEDs stay in time',
+        'The thread that called sendCommandToDcl',
+        'A worker thread named "Queue", fed by a lock-free queue',
+      ],
+      answer: 3,
+      why: 'sendMessageToControlSurface only enqueues and triggers an async wake-up. The "Queue" thread runs BuildAndTransmitPacket and the write, so nobody else waits on the port.',
+    },
+    {
+      q: 'A read from the port starts with a stray byte, then a valid frame. What happens to the valid frame?',
+      options: [
+        'The reader skips the stray byte and parses the frame',
+        'The reader drops everything left in that read, because it only accepts a read that starts with M and T',
+        'The state machine resyncs on the next M',
+        'The CRC fails and the frame is retried',
+      ],
+      answer: 1,
+      why: 'The callback checks the first two bytes of the buffer and sets the remaining length to zero if they are not M and T. There is no scan forward for the next start stamp.',
+    },
+  ]}
+/>
+
+## Words to know
+
+| Term | Meaning |
+|---|---|
+| MCU | The microcontroller that scans the pads, knobs and buttons and drives the LEDs |
+| UART | A two-wire serial link with an agreed speed. Module 1 covers it |
+| Frame | One complete message on the wire, from the `M` to the CRC |
+| Packet type | The first field after the stamp. SYSTEM, BUTTON, LED, PAD, KNOBS, MIDI, CV or SLIDER |
+| Size byte | Data bytes plus one. The extra one is the CRC |
+| CRC | A one-byte checksum computed from every byte before it |
+| State machine | Code that holds a current state and decides what each new byte means from that state |
+| HWMsg_t | The struct that carries a decoded message: type, direction, command and a vector of data values |
+| Handshake | The short exchange at startup that tells each side the other is there |
+| Trailer | The extra byte the reader expects after the CRC on incoming frames. Its value is unknown here |
+| Lock-free queue | A queue many threads can add to without taking a lock |
+| AsyncUpdater | A JUCE helper that asks for a callback on the message thread |
+| Stand-in | A piece of code that plays the part of the hardware so you can test without it |
+
+Next: Module 6 (coming soon).

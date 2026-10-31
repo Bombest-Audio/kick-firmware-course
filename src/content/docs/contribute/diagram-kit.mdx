@@ -1,0 +1,90 @@
+---
+title: Diagram kit
+description: The building blocks for every diagram in this course, with the markup to copy.
+---
+
+Every diagram in the course is plain HTML and CSS from `src/styles/course.css`. No image tool is involved, so labels stay correct and anyone can edit them in a pull request. Colors come from the layer palette on the Start here page.
+
+## Block diagram with wires
+
+<figure class="kd">
+  <div class="kd-row">
+    <div class="kd-node layer-hardware"><b>Node A</b>detail line</div>
+    <div class="kd-wire"><span>data</span></div>
+    <div class="kd-node layer-userspace"><b>Node B</b>detail line</div>
+    <div class="kd-wire control"><span>control</span></div>
+    <div class="kd-node layer-kernel"><b>Node C</b>detail line</div>
+  </div>
+  <div class="kd-legend"><span><i></i>data</span><span><i class="control"></i>control</span><span><i class="clock"></i>clock</span></div>
+  <figcaption>Solid is data, dashed is control, dotted is a clock.</figcaption>
+</figure>
+
+```html
+<figure class="kd">
+  <div class="kd-row">
+    <div class="kd-node layer-hardware"><b>Node A</b>detail line</div>
+    <div class="kd-wire"><span>data</span></div>
+    <div class="kd-node layer-userspace"><b>Node B</b>detail line</div>
+    <div class="kd-wire control"><span>control</span></div>
+    <div class="kd-node layer-kernel"><b>Node C</b>detail line</div>
+  </div>
+  <figcaption>Say what the reader should notice.</figcaption>
+</figure>
+```
+
+Use `kd-row two` for two nodes and one wire. Add `clock` to a wire for a dotted line.
+
+## Step timeline
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>First</b><span class="layer layer-bootloader">bootloader</span><br />What happens.</div>
+    <div class="kd-step"><b>Second</b><span class="layer layer-kernel">kernel</span><br />What happens next.</div>
+    <div class="kd-step"><b>Third</b><span class="layer layer-userspace">user space</span><br />And then.</div>
+  </div>
+</figure>
+
+```html
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>First</b><span class="layer layer-bootloader">bootloader</span><br />What happens.</div>
+  </div>
+</figure>
+```
+
+Steps number themselves.
+
+## Packet anatomy
+
+<figure class="kd">
+  <div class="kd-pkt">
+    <div class="kd-byte layer-hardware"><small>start</small>M</div>
+    <div class="kd-byte layer-hardware"><small>start</small>T</div>
+    <div class="kd-byte layer-userspace"><small>type</small>&nbsp;</div>
+    <div class="kd-byte layer-kernel"><small>data</small>...</div>
+    <div class="kd-byte layer-bootloader"><small>crc</small>&nbsp;</div>
+  </div>
+</figure>
+
+```html
+<div class="kd-pkt">
+  <div class="kd-byte layer-hardware"><small>field name</small>value</div>
+</div>
+```
+
+## Layer chips and the hardware badge
+
+Use `<span class="layer layer-audio">Audio thread</span>` for a layer chip. The layer classes are `layer-hardware`, `layer-bootloader`, `layer-kernel`, `layer-userspace`, `layer-message`, `layer-audio` and `layer-storage`.
+
+Use `<span class="not-verified">Not verified on hardware</span>` for anything nobody has checked on a real unit.
+
+## Code citations and quizzes
+
+Cite code with `CodeRef`. The citation checker (`scripts/check-citations.mjs`) verifies the path, line and expected text against the pinned upstream commit, so a wrong line fails the check. See any lesson for the pattern, and use `Quiz` for the five-question check at the end.
+
+## Rules
+
+- Never generate a diagram with an image model. Hand-build it from these parts.
+- One color per layer, everywhere.
+- Every diagram gets a caption that says what to notice.
+- Test at 375px wide. The kit stacks vertically on small screens.

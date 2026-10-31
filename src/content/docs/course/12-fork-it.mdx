@@ -1,0 +1,1653 @@
+---
+title: '12. Fork it: build your own'
+description: What a fork of the KICK firmware needs today, three levels of customization with worked design sketches, the AGPL-3.0 duties in plain words, trademarks, and what I still do not know.
+---
+
+import { Image } from 'astro:assets';
+import { Aside } from '@astrojs/starlight/components';
+import CodeRef from '../../../components/CodeRef.astro';
+import Quiz from '../../../components/Quiz.astro';
+import hero from '../../../assets/heroes/m12-fork-it.png';
+
+<Image src={hero} alt="A glowing teal path leaves a dark slab and splits into two branches, each ending in a small glowing tile." />
+
+**Module 12 of 12 &#183; about 40 minutes &#183; needs Modules 3, 4 and 7**
+
+You have read the whole machine. Now the real question: can you change it and run your change?
+
+This lesson is the plan, not the proof. I have not built any of it. I compiled nothing for this lesson, I ran no CMake, and every code sketch below is design, not built. What I did was read files at the pinned commit with `git show` and `grep`, and check every cited line. Where I guess, I say so.
+
+By the end you will be able to list exactly which pieces a fork must write before it can compile, say what each piece has to provide, sketch the three kinds of change this course prepared you for, and explain in plain words what the AGPL-3.0 asks of you when you share the result.
+
+<Aside type="note" title="Analogy">
+You inherit a family recipe binder. Most pages are there and readable. Four pages were torn out because the printer would not let the family reprint them. The dishes that need those pages cannot be cooked as written. But the other pages say "add the stock from page 12", so you can work out what page 12 must have been, and write your own. That is a fork today. You rebuild the torn pages, then you start inventing new dishes.
+</Aside>
+
+## Where a fork stands today
+
+The public repository is a cleaned-up drop. Module 0 listed what is absent. This section turns that list into a work plan.
+
+Start with the entry point. The top-level CMake file reads the dependency list:
+
+<CodeRef path="Kick/CMakeLists.txt" line={108} expect="include(3rdParty.cmake)">
+
+```cmake
+include(3rdParty.cmake)
+```
+
+</CodeRef>
+
+That file points two libraries at a placeholder server:
+
+<CodeRef path="Kick/3rdParty.cmake" line={8} expect="https://example.com/your-git-server">
+
+```cmake
+set(MT_PLATFORM_GIT_PATH   "https://example.com/your-git-server" CACHE STRING "Base URL for private platform repositories")
+```
+
+</CodeRef>
+
+The upstream README says the libraries behind that URL are not part of the release:
+
+<CodeRef path="Kick/README.md" line={14} expect="Private dependencies are not included.">
+
+```md
+- **Private dependencies are not included.** `3rdParty.cmake` fetches two internal libraries,
+```
+
+</CodeRef>
+
+But look at the root README. Both libraries are in this repository, with their own folders and the same license:
+
+<CodeRef path="README.md" line={43} expect="AudIO/">
+
+```md
+| [`AudIO/`](AudIO) | Audio engine library | AGPL-3.0-or-later |
+```
+
+</CodeRef>
+
+<CodeRef path="README.md" line={44} expect="ComProtocol/">
+
+```md
+| [`ComProtocol/`](ComProtocol) | Hardware communication protocol | AGPL-3.0-or-later |
+```
+
+</CodeRef>
+
+So the two README files disagree. The folders are there, and what the CMake file expects from them is not. Here is the gap, one piece at a time.
+
+### Gap 1: the AudIO hook
+
+When AudIO is added, CMake includes a file from inside it:
+
+<CodeRef path="Kick/3rdParty.cmake" line={94} expect="juce_modules.cmake">
+
+```cmake
+include(${AudIO_SOURCE_DIR}/juce_modules.cmake)
+```
+
+</CodeRef>
+
+No file named `juce_modules.cmake` exists anywhere in the tree at the pinned commit. I listed every path. The comment in the file shows how to point CMake at a local AudIO copy instead of the URL:
+
+<CodeRef path="Kick/3rdParty.cmake" line={71} expect="CPM_AudIO_SOURCE">
+
+```cmake
+# IF you want to instead point it to a local version, you can invoke CMake with  -DCPM_AudIO_SOURCE="Path_To_AudIO_git_repo"
+```
+
+</CodeRef>
+
+That redirects the download. It does not create the missing hook. Either the include fails, or (if CMake skips the block) nothing registers the AudIO modules. I did not run CMake, so I do not know which.
+
+### Gap 2: two missing JUCE modules
+
+A JUCE module is a folder with a header that carries a declaration block, including its dependencies (Module 4). Two of the declared dependencies have no folder. The audio interface module needs `AudIO_juce`:
+
+<CodeRef path="Kick/modules/audio_interface/audio_interface.h" line={17} expect="dependencies:       AudIO_juce">
+
+```text
+dependencies:       AudIO_juce
+```
+
+</CodeRef>
+
+The common module needs `AudIO_constants`:
+
+<CodeRef path="Kick/modules/common/common.h" line={17} expect="AudIO_constants">
+
+```text
+dependencies:       signal, fpm, magic_enum, AudIO_constants, juce_gui_basics
+```
+
+</CodeRef>
+
+These two are not side modules. Almost everything sits on top of them. The engine's `interface` module depends on both:
+
+<CodeRef path="Kick/modules/engine/interface/interface.h" line={17} expect="dependencies:       common, audio_interface">
+
+```text
+dependencies:       common, audio_interface
+```
+
+</CodeRef>
+
+The audio engine depends on `interface`:
+
+<CodeRef path="Kick/modules/engine/audio_engine/audio_engine.h" line={17} expect="dependencies:       interface, audio_interface, audio_program, project, audio_midi">
+
+```text
+dependencies:       interface, audio_interface, audio_program, project, audio_midi
+```
+
+</CodeRef>
+
+And the UI sits on the engine's `project` module. So the missing modules are at the bottom of the whole stack, and that includes the simulator.
+
+### Gap 3: the serial class
+
+The module that talks to the control surface lists two dependencies that are not ordinary:
+
+<CodeRef path="Kick/modules/input_events/input_events.h" line={17} expect="dependencies:       signal, PktMgr, juce_serialport">
+
+```text
+dependencies:       signal, PktMgr, juce_serialport
+```
+
+</CodeRef>
+
+The serial class `juce_serialport` was removed on purpose, because it had no license (Module 0). The build still registers it:
+
+<CodeRef path="Kick/modules/3rdParty/CMakeLists.txt" line={5} expect="juce_serialport">
+
+```cmake
+juce_serialport
+```
+
+</CodeRef>
+
+### Gap 4: PktMgr is a folder of files, not a module
+
+The packet library is fetched and registered as a JUCE module:
+
+<CodeRef path="Kick/3rdParty.cmake" line={109} expect="COM_PROTOCOL_SOURCE_DIR}/PktMgr)">
+
+```cmake
+juce_add_modules(${COM_PROTOCOL_SOURCE_DIR}/PktMgr)
+```
+
+</CodeRef>
+
+The folder holds `Defines.hpp`, `PktMgr.cpp` and `PktMgr.hpp`. It has no header with a module declaration block. General JUCE knowledge: `juce_add_modules` expects a module header named after the folder, and I expect configure to complain about this folder. I did not run it. Callers include the packet class by its `.hpp` path:
+
+<CodeRef path="Kick/modules/input_events/input_events.h" line={51} expect={`#include <PktMgr/PktMgr.hpp`}>
+
+```cpp
+#include <PktMgr/PktMgr.hpp>
+```
+
+</CodeRef>
+
+The cheap fix is to skip the module idea. Put the `ComProtocol` folder on the include path and compile `PktMgr.cpp` as a normal source file. Module 5 built the packet class alone on my Mac, so that part has a precedent.
+
+### Gap 5: assets
+
+The upstream README lists what was removed. Two items hit you at runtime, not at compile time:
+
+<CodeRef path="Kick/README.md" line={26} expect="Audio samples">
+
+```md
+- Audio samples (factory content and metronome / percussion sounds).
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/README.md" line={27} expect="Myriad Pro">
+
+```md
+- The Myriad Pro font. Supply any font you have the rights to.
+```
+
+</CodeRef>
+
+### Gap 6: the cross-compile SDK
+
+For the device (not the desktop), you need a compiler that makes ARM code. The upstream README says there is no prebuilt SDK and tells you to build one from the Buildroot tree:
+
+<CodeRef path="Kick/README.md" line={17} expect="No cross-compilation SDK.">
+
+```md
+- **No cross-compilation SDK.** Build one from the companion Buildroot tree
+```
+
+</CodeRef>
+
+Module 3 covers how the app gets cross-compiled. Nothing here changes that story.
+
+### The picture
+
+<figure class="kd">
+  <div class="kd-row">
+    <div class="kd-node layer-hardware"><b>common</b>needs AudIO_constants, which is absent</div>
+    <div class="kd-node layer-hardware"><b>audio_interface</b>needs AudIO_juce, which is absent</div>
+    <div class="kd-node layer-hardware"><b>input_events</b>needs juce_serialport (absent) and PktMgr (no module header)</div>
+  </div>
+  <figcaption>Three modules at the bottom of the stack name things the tree does not contain. The engine and the UI sit above them.</figcaption>
+</figure>
+
+## The simulator: a template, not a working tool
+
+The upstream notes call the desktop simulator the recommended way to iterate on UI and input. It is the right idea. I read the code, and I would not trust it as shipped.
+
+It is switched on by an option, default off:
+
+<CodeRef path="Kick/CMakeLists.txt" line={24} expect="KICK_SIMULATOR">
+
+```cmake
+option( KICK_SIMULATOR "KICK Simulator" OFF )
+```
+
+</CodeRef>
+
+The option adds one folder. The target inside it is named `KT_KickEM`, not `kickem`:
+
+<CodeRef path="Kick/apps/CMakeLists.txt" line={22} expect="add_subdirectory(kickem)">
+
+```cmake
+add_subdirectory(kickem)
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/apps/kickem/CMakeLists.txt" line={3} expect="set(TargetName KT_KickEM)">
+
+```cmake
+set(TargetName KT_KickEM)
+```
+
+</CodeRef>
+
+It defines a macro that the rest of the code tests:
+
+<CodeRef path="Kick/apps/kickem/CMakeLists.txt" line={41} expect="SIM_BUILD=1">
+
+```cmake
+SIM_BUILD=1
+```
+
+</CodeRef>
+
+It links the UI modules, not the audio engine directly:
+
+<CodeRef path="Kick/apps/kickem/CMakeLists.txt" line={79} expect="kick_ui">
+
+```cmake
+kick_ui
+```
+
+</CodeRef>
+
+And it opens full screen:
+
+<CodeRef path="Kick/apps/kickem/Main.cpp" line={65} expect="setFullScreen(true);">
+
+```cpp
+setFullScreen(true);
+```
+
+</CodeRef>
+
+### What it stubs
+
+On the device, `InputEvents::initialize` opens the serial port (Module 5). In a simulator build, a macro swaps that branch. The code asks a factory for a simulator object and listens to its signal:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={308} expect="#ifdef SIM_BUILD">
+
+```cpp
+#ifdef SIM_BUILD
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={310} expect={`simInterface = Factory<SimulatorInterface`}>
+
+```cpp
+simInterface = Factory<SimulatorInterface>::makeObject( 0 );
+```
+
+</CodeRef>
+
+So the simulator replaces the serial wire with on-screen pads and buttons, and it fakes the hardware's replies to LED commands. That is the plan. Now the problems.
+
+### Five reasons I do not trust it
+
+**1. The input signal has the wrong shape.** The simulator branch fires the dispatch signal with an integer and a byte vector:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={312} expect="Controls::InputEvents::dispatchHardwareEvent( id, data );">
+
+```cpp
+Controls::InputEvents::dispatchHardwareEvent( id, data );
+```
+
+</CodeRef>
+
+But the signal is declared to carry a packet struct. Module 5 flagged this already:
+
+<CodeRef path="Kick/modules/input_events/input_events.h" line={65} expect="dispatchHardwareEvent;">
+
+```cpp
+static sigslot::signal<CPktMgr::HWMsg_t&> dispatchHardwareEvent;
+```
+
+</CodeRef>
+
+**2. The output call has the wrong shape too.** The send path hands the simulator one packet:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={359} expect={`sendMessageToHW( f_HwMsg );`}>
+
+```cpp
+if( simInterface ) simInterface->sendMessageToHW( f_HwMsg );
+```
+
+</CodeRef>
+
+But the simulator interface declares a function that takes a code and a byte vector:
+
+<CodeRef path="Kick/modules/input_events/kick_SimulatorInterface.h" line={7} expect={`virtual void sendMessageToHW( int code, const std::vector<juce::int8`}>
+
+```cpp
+virtual void sendMessageToHW( int code, const std::vector<juce::int8>& ) = 0;
+```
+
+</CodeRef>
+
+**3. Names with no definition.** The simulator uses an enum of button commands, a pad state type, and a signal type from a namespace called `sig`:
+
+<CodeRef path="Kick/apps/kickem/simulator/kick_Simulator.cpp" line={66} expect="mt::Kick::HwControlCommands">
+
+```cpp
+impl->hwInputReceived.emit((mt::Kick::HwControlCommands)pad, data);
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/apps/kickem/simulator/kick_SimulatorInterfaceImpl.h" line={20} expect="sig::Signal">
+
+```cpp
+inline static sig::Signal<int, const std::vector<juce::int8>&> hwMessageReceived = {};
+```
+
+</CodeRef>
+
+I searched `Kick/`, `AudIO/` and `ComProtocol/` for a definition of `HwControlCommands`, `PadButtonState` and `sig::Signal`. I found none. The signal library in the tree is `sigslot`, a different name.
+
+**4. No generated header.** The common module includes a header that CMake generates:
+
+<CodeRef path="Kick/modules/common/common.h" line={45} expect={`#include "config.h"`}>
+
+```cpp
+#include "config.h"
+```
+
+</CodeRef>
+
+The main app generates it from a template:
+
+<CodeRef path="Kick/apps/kick/CMakeLists.txt" line={39} expect="/config.h.in ">
+
+```cmake
+configure_file(${CMAKE_SOURCE_DIR}/config.h.in ${CMAKE_CURRENT_BINARY_DIR}/config.h)
+```
+
+</CodeRef>
+
+I read the whole simulator CMake file and found no such call. By my reading the simulator target would not find `config.h`.
+
+**5. The same missing modules.** `kick_ui` still sits on `common`, `audio_interface` and the rest of Gap 2. The simulator needs the stand-ins as much as the device app does.
+
+### What I conclude
+
+The simulator was written for an older version of the input path. Treat it as a design to copy, not a tool to run. The better route is the one Module 5 described as Option A: skip the wire, build a packet struct yourself, and fire the real dispatch signal from the message thread. You get a simulator by writing about a hundred lines that feed the right signal, not by fixing the old one.
+
+Two smaller notes. The build pulls its own JUCE and patches it:
+
+<CodeRef path="Kick/3rdParty.cmake" line={14} expect="7.0.12">
+
+```cmake
+set(JUCE_GIT_TAG           7.0.12)
+```
+
+</CodeRef>
+
+The patch file name is keyed to that tag, and a failed patch stops configure:
+
+<CodeRef path="Kick/3rdParty.cmake" line={56} expect="Failed to apply patch to JUCE">
+
+```cmake
+message(FATAL_ERROR "Failed to apply patch to JUCE: ${patch_result}")
+```
+
+</CodeRef>
+
+So do not point the build at a newer JUCE you already have on disk and expect it to work. The patch targets 7.0.12. The Apple deployment target is fixed at 12.0:
+
+<CodeRef path="Kick/CMakeLists.txt" line={78} expect="12.0">
+
+```cmake
+set (CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE INTERNAL "")
+```
+
+</CodeRef>
+
+## The stand-in plan
+
+A stand-in is code you write to fill a hole, so the rest of the program can compile and run. You cannot copy the original, because you do not have it. But you have every caller. The callers tell you what the hole must hold.
+
+The method is plain:
+
+1. `grep` for every use of the missing name.
+2. For each use, write down the type it needs, whether it must be a compile-time constant, and the operations it calls.
+3. Build the smallest thing that satisfies all of them.
+4. Mark every value you chose without evidence.
+
+I did steps 1 and 2 for four holes. Step 3 is yours. Every value I propose is a guess unless I cite a line.
+
+### Stand-in 1: `AudIO_constants`
+
+This module supplies numbers. The callers use them in four ways.
+
+**Audio format.** The audio manager asks the engine to start the device with a sample rate and a block size, and builds the device with a channel count:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={61} expect="engine.startAudioDevice( AUDIO_SAMPLE_RATE, AUDIO_BLOCK_SIZE );">
+
+```cpp
+engine.startAudioDevice( AUDIO_SAMPLE_RATE, AUDIO_BLOCK_SIZE );
+```
+
+</CodeRef>
+
+The engine object takes five more counts:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.h" line={109} expect="AUDIO_NUM_SEND_RETURNS">
+
+```cpp
+AudIO::DawEngine engine{ AUDIO_NUM_INPUTS, AUDIO_NUM_OUTPUTS, AUDIO_NUM_SEND_RETURNS, AUDIO_NUM_SUBMIX, AUDIO_NUM_AUX };
+```
+
+</CodeRef>
+
+The engine constructor takes unsigned integers for those five:
+
+<CodeRef path="AudIO/AudIO/Daw/DawEngine.h" line={35} expect="DawEngine( unsigned int ninputs">
+
+```cpp
+DawEngine( unsigned int ninputs, unsigned int noutputs, unsigned int nsendreturns = 0, unsigned int nsubmix = 0, unsigned int naux = 0 );
+```
+
+</CodeRef>
+
+A block size becomes the width of a buffer, so it must be a compile-time integer:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.h" line={73} expect={`tempBuffer{ 2, AUDIO_BLOCK_SIZE }`}>
+
+```cpp
+juce::AudioBuffer<float>   tempBuffer{ 2, AUDIO_BLOCK_SIZE };
+```
+
+</CodeRef>
+
+The sample rate is used as a `double`:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audio_sound.h" line={157} expect={`resamplingRate{ AUDIO_SAMPLE_RATE }`}>
+
+```cpp
+double              resamplingRate{ AUDIO_SAMPLE_RATE };
+```
+
+</CodeRef>
+
+What do I know about the values? The engine clamps any requested block to 480:
+
+<CodeRef path="AudIO/AudIO/Daw/DawEngine.cpp" line={22} expect="#define BLOCK_SIZE    ( 480 )">
+
+```cpp
+#define BLOCK_SIZE    ( 480 )
+```
+
+</CodeRef>
+
+AudIO's own example uses 48000 and 480:
+
+<CodeRef path="AudIO/AudIO/Example/Daw/DawExampleMain.cpp" line={33} expect="_eng.startAudioDevice( 48000, 480 );">
+
+```cpp
+_eng.startAudioDevice( 48000, 480 );
+```
+
+</CodeRef>
+
+A voice class holds a 48000 field too (Module 7 would not claim the device rate from that alone, and neither do I):
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.h" line={79} expect={`sampleRate{ 48000 }`}>
+
+```cpp
+double sampleRate{ 48000 };
+```
+
+</CodeRef>
+
+So a sensible starting point is 48000 and 480. It is a starting point, not the real shipped values. Module 6 explains why the real block size matters.
+
+**MIDI range and scale.** The `MIDI` names are used about 230 times across the tree. A gain conversion pair shows what the three core names must do. One direction multiplies by a scale:
+
+<CodeRef path="Kick/modules/common/source/kick_common_utils.cpp" line={50} expect="return ( MIDI::SCALER * MidiValue );">
+
+```cpp
+return ( MIDI::SCALER * MidiValue );
+```
+
+</CodeRef>
+
+The other multiplies by the maximum and clamps:
+
+<CodeRef path="Kick/modules/common/source/kick_common_utils.cpp" line={55} expect="jlimit( MIDI::MIN, MIDI::MAX">
+
+```cpp
+return (int)juce::jlimit( MIDI::MIN, MIDI::MAX, (int)( Gain * MIDI::MAX ) );
+```
+
+</CodeRef>
+
+A comment next to the first use gives away the intent:
+
+<CodeRef path="Kick/modules/common/source/kick_common_utils.cpp" line={38} expect="// (MidiLevel / 127 )">
+
+```cpp
+auto factor = (float)( MIDI::SCALER * MidiValue ); // (MidiLevel / 127 )
+```
+
+</CodeRef>
+
+That comment, plus the two functions being inverses of each other, makes `MIN = 0`, `MAX = 127` and `SCALER = 1/127` the consistent choice. Full range of a MIDI data byte is 0 to 127 (general knowledge). That is a deduction from two call sites and a comment, not a quote of the original.
+
+The other `MIDI` names come from call sites too. `MIDI::LEVEL_DEFAULT` and `MIDI::STEP` feed a slider range:
+
+<CodeRef path="Kick/modules/kick_ui/modes/knobedit/kick_KnobGrid.cpp" line={194} expect="setRange( MIDI::MIN, MIDI::LEVEL_DEFAULT, MIDI::STEP )">
+
+```cpp
+qlinkKnobs[knobnum]->setRange( MIDI::MIN, MIDI::LEVEL_DEFAULT, MIDI::STEP );
+```
+
+</CodeRef>
+
+`MIDI::NUMERIC_MAX` bounds a loop over pad colours:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_interface_types.cpp" line={371} expect={`pad < MIDI::NUMERIC_MAX`}>
+
+```cpp
+for( auto pad = MIDI::MIN; pad < MIDI::NUMERIC_MAX; ++pad )
+```
+
+</CodeRef>
+
+The colour arrays it indexes hold 128 entries, so the value cannot exceed 128:
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_iprogram.h" line={44} expect={`std::array<int, 128`}>
+
+```cpp
+const std::array<int, 128> defaultPadColours{ contracts::DeviceControlContracts::PadColourRed };
+```
+
+</CodeRef>
+
+`MIDI::MIDDLE_C` is a default note for a key group:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_interface_types.cpp" line={132} expect="MIDI::MIDDLE_C">
+
+```cpp
+keyNote.referTo( vTree, IDs::keyNote, UM, MIDI::MIDDLE_C );
+```
+
+</CodeRef>
+
+**Polyphony.** `POLYPHONY::MIN` and `POLYPHONY::MAX` are template arguments, so they must be compile-time integers:
+
+<CodeRef path="Kick/modules/common/source/kick_ValueTreeConstrainers.h" line={91} expect={`RangeConstrainer<int, POLYPHONY::MIN, POLYPHONY::MAX`}>
+
+```cpp
+using PolyphonyConstrainer     = ConstrainerWrapper<int, RangeConstrainer<int, POLYPHONY::MIN, POLYPHONY::MAX>>;
+```
+
+</CodeRef>
+
+`POLYPHONY::MAX` is also the voice count a synth object is built with, and `DEFAULT` and `STEP` feed the UI:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={34} expect="POLYPHONY::MAX">
+
+```cpp
+numPolyphony = AudIO::utils::limit<int>( 0, POLYPHONY::MAX, Polyphony );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui/modes/knobedit/kick_KnobGrid.cpp" line={248} expect="POLYPHONY::STEP">
+
+```cpp
+qlinkKnobs[knobnum]->setRange( POLYPHONY::MIN, POLYPHONY::MAX, POLYPHONY::STEP );
+```
+
+</CodeRef>
+
+A sampler header sets 16 for its own per-object cap (Module 7 says that stack looks unused), so 16 is a plausible placeholder. Do not quote it as the real value.
+
+**Design sketch, not built.** This is the shape of the stand-in. Values marked `?` are guesses with no evidence.
+
+```cpp
+// AudIO_constants/AudIO_constants.h   (design, not built, not compiled)
+#pragma once
+
+constexpr double       AUDIO_SAMPLE_RATE = 48000.0;  // AudIO example uses 48000
+constexpr unsigned int AUDIO_BLOCK_SIZE  = 480;      // engine clamps to 480
+constexpr unsigned int AUDIO_NUM_INPUTS  = 2;        // ?
+constexpr unsigned int AUDIO_NUM_OUTPUTS = 2;        // ?
+constexpr unsigned int AUDIO_NUM_SEND_RETURNS = 0;   // ?
+constexpr unsigned int AUDIO_NUM_SUBMIX  = 0;        // ?
+constexpr unsigned int AUDIO_NUM_AUX     = 0;        // ?
+
+namespace MIDI {
+    constexpr int   MIN = 0;
+    constexpr int   MAX = 127;
+    constexpr float SCALER = 1.0f / 127.0f;   // from the (MidiLevel / 127) comment
+    constexpr int   NUMERIC_MAX = 128;        // array size is 128
+    constexpr int   MIDDLE_C = 60;            // general MIDI convention
+    constexpr int   STEP = 1;                 // ?
+    constexpr int   DEFAULT = 64;             // ? read the four call sites first
+    constexpr int   LEVEL_DEFAULT = 100;      // ?
+    constexpr int   NOTE_DEFAULT = 60;        // ?
+}
+namespace POLYPHONY {
+    constexpr int MIN = 1, MAX = 16, DEFAULT = 16, STEP = 1;  // all ?
+}
+```
+
+Whether those names live at global scope or inside another namespace I cannot tell. The first compile will tell you. Also check the grep yourself, because I counted names, not the whole tree of expressions.
+
+### Stand-in 2: `AudIO_juce`
+
+This module holds `AudioDevice`, the class that connects JUCE's audio hardware to the AudIO engine. Module 6 flagged it. Here is what the callers need.
+
+The audio manager builds one device with an input count, an output count and a name:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={56} expect={`make_unique<AudioDevice`}>
+
+```cpp
+dm = std::make_unique<AudioDevice>( AUDIO_NUM_INPUTS, AUDIO_NUM_OUTPUTS, juce::String() );
+```
+
+</CodeRef>
+
+It hands the device to the engine as a pointer:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={60} expect={`engine.addAudioDevice( "Master", dm.get(), true );`}>
+
+```cpp
+engine.addAudioDevice( "Master", dm.get(), true );
+```
+
+</CodeRef>
+
+The engine function takes the AudIO device interface:
+
+<CodeRef path="AudIO/AudIO/Daw/DawEngine.cpp" line={180} expect="IAudioDevice* device">
+
+```cpp
+bool DawEngine::addAudioDevice( const std::string& name, IAudioDevice* device, bool /*master*/ )
+```
+
+</CodeRef>
+
+So `AudioDevice` must derive from `AudIO::IAudioDevice`. That interface has four pure virtual functions. Here is the first:
+
+<CodeRef path="AudIO/AudIO/Includes/IAudioDevice.h" line={37} expect="virtual void start( uint32_t samplerate, uint32_t blocksize ) = 0;">
+
+```cpp
+virtual void start( uint32_t samplerate, uint32_t blocksize ) = 0;
+```
+
+</CodeRef>
+
+The others are `resume`, `pause` and `stop`. The base class also supplies a protected `process` that hands a buffer to the engine:
+
+<CodeRef path="AudIO/AudIO/Includes/IAudioDevice.h" line={55} expect={`virtual void process( Buffer<float`}>
+
+```cpp
+virtual void process( Buffer<float>& buf )
+```
+
+</CodeRef>
+
+That is the hook your JUCE callback must call, once per block, after copying input samples in. After it returns, you copy the buffer's output side to the JUCE output channels. That is my reading of the design from Module 6, plus general JUCE knowledge about audio callbacks.
+
+There is one more caller. The audio manager asks the device for JUCE's device manager:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={303} expect={`getJuceAudioDeviceMgr()`}>
+
+```cpp
+return dm->getJuceAudioDeviceMgr();
+```
+
+</CodeRef>
+
+And the class is forward-declared inside the `mt` namespace, which tells you where the real one lived:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.h" line={34} expect="class AudioDevice;">
+
+```cpp
+class AudioDevice;
+```
+
+</CodeRef>
+
+One more clue. AudIO's own module header has an empty block for the JUCE extensions:
+
+<CodeRef path="AudIO/AudIO/AudIO.h" line={127} expect="AUDIO_JUCE_EXTENSIONS">
+
+```cpp
+#if defined( AUDIO_JUCE_EXTENSIONS ) && ( AUDIO_JUCE_EXTENSIONS > 0 )
+```
+
+</CodeRef>
+
+My guess, and it is only a guess: the private AudIO repo exported separate JUCE modules named `AudIO_juce` and `AudIO_constants`, and the engine code reaches the `AudIO::` classes through them. The engine modules do not list AudIO itself as a dependency, so something in the stand-in must include `AudIO/AudIO.h` (its declared ID is `AudIO`). I traced `AudioDevice` only. Expect the first compile to reveal more names.
+
+**Design sketch, not built.**
+
+```cpp
+// AudIO_juce/AudIO_juce.h   (design, not built, not compiled)
+#pragma once
+#include <juce_audio_devices/juce_audio_devices.h>
+#include <AudIO/AudIO.h>
+
+namespace mt {
+class AudioDevice : public AudIO::IAudioDevice,
+                    private juce::AudioIODeviceCallback
+{
+public:
+    AudioDevice( uint32_t nIn, uint32_t nOut, const juce::String& name );
+    void start( uint32_t sampleRate, uint32_t blockSize ) override;  // open device, add callback
+    void resume() override;
+    void pause()  override;
+    void stop()   override;
+    juce::AudioDeviceManager& getJuceAudioDeviceMgr() { return deviceMgr; }
+private:
+    // JUCE callback: copy device input into the AudIO buffer, call process( _buffer ),
+    // copy the output side back to the device channels.
+    juce::AudioDeviceManager deviceMgr;
+};
+}
+```
+
+Notice that the audio callback must follow the rules from Module 6: no allocation, no locks, no file access. The device wrapper is where that discipline either holds or breaks.
+
+### Stand-in 3: `juce_serialport`
+
+The call sites are all in one file, and Module 5 walked them. Here is the full interface they need.
+
+A static lookup of port paths:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={48} expect="SerialPort::getSerialPortPaths()">
+
+```cpp
+juce::StringPairArray portlist = SerialPort::getSerialPortPaths();
+```
+
+</CodeRef>
+
+A config object built from baud, data bits, parity, stop bits and flow control:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={61} expect="SerialPortConfig config( 230400, 8,">
+
+```cpp
+SerialPortConfig config( 230400, 8, SerialPortConfig::SERIALPORT_PARITY_NONE, SerialPortConfig::STOPBITS_1, SerialPortConfig::FLOWCONTROL_NONE );
+```
+
+</CodeRef>
+
+A port built from a path, the config and a two-string debug callback:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={79} expect="new SerialPort( devPath, config, serialDebug )">
+
+```cpp
+sPort.reset( new SerialPort( devPath, config, serialDebug ) );
+```
+
+</CodeRef>
+
+An input stream on the port that raises change messages when bytes arrive:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={80} expect="new SerialPortInputStream( sPort.get() )">
+
+```cpp
+input.reset( new SerialPortInputStream( sPort.get() ) );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={82} expect="setNotify( SerialPortInputStream::NOTIFY_ALWAYS )">
+
+```cpp
+input->setNotify( SerialPortInputStream::NOTIFY_ALWAYS );
+```
+
+</CodeRef>
+
+An output stream with `write` and `flush`:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={149} expect={`write( outData.getData(), outData.getSize() );`}>
+
+```cpp
+output->write( outData.getData(), outData.getSize() );
+```
+
+</CodeRef>
+
+And `read` plus `getTotalLength` on the input side, and `close` on the port:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={165} expect={`read( serialData.getData()`}>
+
+```cpp
+input->read( serialData.getData(), (int)input->getTotalLength() );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={99} expect={`if( sPort ) sPort`}>
+
+```cpp
+if( sPort ) sPort->close();
+```
+
+</CodeRef>
+
+The call sites fit a JUCE input stream that is also a change broadcaster, because the code registers a change listener on it:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={81} expect={`addChangeListener( this );`}>
+
+```cpp
+input->addChangeListener( this );
+```
+
+</CodeRef>
+
+Summing up the needed surface: one static function, one config class with five constructor arguments and the enum values listed above, three classes (`SerialPort`, `SerialPortInputStream`, `SerialPortOutputStream`), and the methods `close`, `setNotify`, `addChangeListener`, `read`, `getTotalLength`, `write` and `flush`. The missing source would settle the exact base classes. I did not read it, because it is not in the tree.
+
+Two useful facts for a desktop stand-in. The serial setup code is wrapped in a Linux-only guard:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={45} expect="#if( JUCE_LINUX || __linux__ )">
+
+```cpp
+#if( JUCE_LINUX || __linux__ )
+```
+
+</CodeRef>
+
+But the three pointer members are declared on every platform:
+
+<CodeRef path="Kick/modules/input_events/input_events.cpp" line={292} expect={`std::unique_ptr<SerialPort`}>
+
+```cpp
+std::unique_ptr<SerialPort>             sPort;
+```
+
+</CodeRef>
+
+So on a Mac, a header that declares the three classes and a `close` method might be enough to compile this file. I have not tried it. On the device you need a real one. The Buildroot defconfig already enables a C serial library, which is a sensible base for it:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={106} expect="BR2_PACKAGE_LIBSERIALPORT=y">
+
+```text
+BR2_PACKAGE_LIBSERIALPORT=y
+```
+
+</CodeRef>
+
+Write your own wrapper. Do not paste in an unlicensed class from somewhere else. The upstream README removed this one because it had no license (Gap 3), and the same problem would follow it into your fork.
+
+### Stand-in 4: a `PktMgr` build rule
+
+This one is not a code stand-in. It is a build change. Compile `PktMgr.cpp` as a plain source file, add the `ComProtocol` folder to the include path so that `#include <PktMgr/PktMgr.hpp>` resolves, and drop the `juce_add_modules` call from `3rdParty.cmake`. The `input_events` module also lists `PktMgr` in its dependency line (Gap 3), so you edit that line to match.
+
+One more oddity while you are in that header. Its module declaration gives it the wrong ID:
+
+<CodeRef path="Kick/modules/input_events/input_events.h" line={9} expect="ID:                 kick_ui_controls">
+
+```text
+ID:                 kick_ui_controls
+```
+
+</CodeRef>
+
+The module lives in the `input_events` folder, and the registration list uses that name. I do not know what JUCE's CMake does when the declared ID and the folder disagree. It is a copy-paste leftover, by my reading. Check it on your first configure.
+
+### The work, in one table
+
+| Hole | Provides | Evidence for the interface | Unknown |
+|---|---|---|---|
+| `AudIO_constants` | Numbers: audio format, MIDI range, polyphony | `mt_audio_manager.cpp:61`, `kick_common_utils.cpp:38`, `:50`, `:55`, `kick_ValueTreeConstrainers.h:91` | Every real value |
+| `AudIO_juce` | `mt::AudioDevice` deriving from `IAudioDevice` | `mt_audio_manager.cpp:56`, `:60`, `:303`, `IAudioDevice.h:37` | What else the module exports |
+| `juce_serialport` | Port, config, input and output streams | `input_events.cpp` lines 48 to 165 | Base classes of the streams |
+| `PktMgr` rule | Include path and a compiled source | `input_events.h:51` | JUCE behavior on the odd module ID |
+| `juce_modules.cmake` | Registers AudIO modules | `3rdParty.cmake:94` | What the original did |
+| Assets | Samples and a font | `Kick/README.md:26` and `:27` | Which names the code looks up |
+
+## Three levels of customization
+
+These are the three kinds of change this course prepared you for. Each is labeled design, not built. Each assumes the stand-ins exist.
+
+<figure class="kd">
+  <div class="kd-row">
+    <div class="kd-node layer-audio"><b>Level 1: an effect</b>AudIO wrapper pattern, Module 7</div>
+    <div class="kd-node layer-userspace"><b>Level 2: a screen</b>IScreen and KickHome, Module 4</div>
+    <div class="kd-node layer-kernel"><b>Level 3: an OS image</b>Buildroot overlay and defconfig, Module 3</div>
+  </div>
+  <figcaption>Risk rises left to right. A new effect cannot brick anything. A new image can.</figcaption>
+</figure>
+
+### Level 1: add an effect (design, not built)
+
+Module 7 showed the wrapper pattern: an Airwindows effect is a class that derives from a shim, and a static registration puts it in the factory. A new effect of your own uses the same road.
+
+The shim class is the base:
+
+<CodeRef path="AudIO/AudIO/airwindows/audioeffectx.h" line={18} expect="class AudioEffectX : public AudIO::Object">
+
+```cpp
+class AudioEffectX : public AudIO::Object
+```
+
+</CodeRef>
+
+The registration macro, from Module 7:
+
+<CodeRef path="AudIO/AudIO/airwindows/audioeffectx.h" line={16} expect="#define REG_AIRWIN( Name, Cat )">
+
+```cpp
+#define REG_AIRWIN( Name, Cat ) REGISTER_OBJECT_WITH_ARGS( #Name, Name, 1, "AirWindows", "Plugin", #Cat );
+```
+
+</CodeRef>
+
+The audio loop is one function with four pointers:
+
+<CodeRef path="AudIO/AudIO/airwindows/src/Acceleration/AccelerationProc.cpp" line={12} expect="float* in1  =  inputs[0];">
+
+```cpp
+float* in1  =  inputs[0];
+```
+
+</CodeRef>
+
+And one registration block lives in the big aggregate file:
+
+<CodeRef path="AudIO/AudIO/airwindows/airwindows.cpp" line={13} expect="REG_AIRWIN( Acceleration, Brightness )">
+
+```cpp
+REG_AIRWIN( Acceleration, Brightness )
+```
+
+</CodeRef>
+
+**The sketch.** I would write a one-knob saturator and call it `Warm`.
+
+1. Copy the folder `src/Acceleration` to `src/Warm`. Rename the three files and the class. Copying beats writing from scratch, because the header has several virtual functions (chunks, program names, `canDo`) that I do not know are optional. The compiler will tell you.
+2. Keep one parameter. The Acceleration header declares its parameter count as an enum value:
+
+<CodeRef path="AudIO/AudIO/airwindows/src/Acceleration/Acceleration.h" line={21} expect="kNumParameters = 2">
+
+```cpp
+kNumParameters = 2
+```
+
+</CodeRef>
+
+   So change that to 1 and delete parameter B everywhere it appears (setter, getter, name, display, chunk functions).
+3. Rewrite the loop in the third file. A tanh saturator, normalized so full scale stays full scale:
+
+```cpp
+// WarmProc.cpp   (design, not built, not compiled)
+void Warm::processReplacing(float **inputs, float **outputs, VstInt32 sampleFrames)
+{
+    float* in1  = inputs[0];
+    float* in2  = inputs[1];
+    float* out1 = outputs[0];
+    float* out2 = outputs[1];
+
+    const double drive = 1.0 + A * 9.0;        // A is the 0..1 knob
+    const double norm  = 1.0 / tanh(drive);    // keeps a full-scale peak at full scale
+
+    while (--sampleFrames >= 0)
+    {
+        *out1 = (float)(tanh(drive * *in1) * norm);
+        *out2 = (float)(tanh(drive * *in2) * norm);
+        in1++; in2++; out1++; out2++;
+    }
+}
+```
+
+   This effect has no memory between samples, so it does not need the sample-rate scaling that Acceleration does. That scaling starts from a 44.1 kHz base:
+
+<CodeRef path="AudIO/AudIO/airwindows/src/Acceleration/AccelerationProc.cpp" line={18} expect="overallscale /= 44100.0;">
+
+```cpp
+overallscale /= 44100.0;
+```
+
+</CodeRef>
+
+   (Module 7 said I had not read that base. Now I have: it is 44100.) Note the effect is nonlinear, so it creates harmonics above the old signal and can alias at high drive. General DSP knowledge, and a good reason to listen before you ship.
+4. Register it. In `airwindows.cpp`, add a block like the Acceleration one: include the header, call `REG_AIRWIN( Warm, Saturation )`, then include the two source files. I picked `Saturation` as a category name myself. The category list reads the `Type` field of every record, so a new name would show up as a new category (Module 7):
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_interface.cpp" line={1948} expect="categories.emplace( it.second.Type );">
+
+```cpp
+categories.emplace( it.second.Type );
+```
+
+</CodeRef>
+
+5. Test it away from the KICK first. AudIO has its own CMake file with a target for the Airwindows effects, so you can listen to the effect without the KICK app and without any stand-in:
+
+<CodeRef path="AudIO/CMakeLists.txt" line={104} expect="add_library(AirWindows_plugins">
+
+```cmake
+add_library(AirWindows_plugins
+```
+
+</CodeRef>
+
+   The file list for that target names only the two aggregate `.cpp` files, so a new effect has to arrive through an include in one of them. That matches step 4.
+
+   AudIO's basic example creates an object by name, which is how you would summon `Warm`:
+
+<CodeRef path="AudIO/AudIO/Example/BasicUsage/Main.cpp" line={64} expect={`createObject( "SineWave" )`}>
+
+```cpp
+auto sine1  = pDesign1->createObject( "SineWave" );
+```
+
+</CodeRef>
+
+   Swap the name, patch it between a source and the output, and listen. I did not build the example.
+6. Last check: an insert chain holds four slots, so your effect competes for one:
+
+<CodeRef path="AudIO/AudIO/Daw/DawInserts.h" line={15} expect={`MAX_INSERTS{ 4 }`}>
+
+```cpp
+const static int MAX_INSERTS{ 4 };
+```
+
+</CodeRef>
+
+Risk: low. A wrong effect makes noise, not damage. The part I cannot judge is whether the standalone AudIO build compiles on your machine today.
+
+### Level 2: add a screen (design, not built)
+
+Module 4 listed four places a screen touches. Here they are with a concrete case: a screen called `Hello` that shows a line of text.
+
+**Step 1, the enum.** Add a name before `Temp`. The list ends like this:
+
+<CodeRef path="Kick/modules/kick_ui_common/source/kick_IScreen.h" line={64} expect="Inserts,">
+
+```cpp
+Inserts,
+```
+
+</CodeRef>
+
+Insert `Hello,` between `Inserts` and `Temp`.
+
+**Step 2, the class.** A screen is a JUCE component that also derives from `IScreen` and passes its enum value to the base:
+
+<CodeRef path="Kick/modules/kick_ui_common/source/kick_IScreen.h" line={85} expect="explicit IScreen( Screen Scr )">
+
+```cpp
+explicit IScreen( Screen Scr )
+```
+
+</CodeRef>
+
+Two yes/no questions decide which bars show:
+
+<CodeRef path="Kick/modules/kick_ui_common/source/kick_IScreen.h" line={99} expect="virtual bool requiresStatusBar()">
+
+```cpp
+virtual bool requiresStatusBar() { return true; };
+```
+
+</CodeRef>
+
+The app window is a fixed size, so you can draw against it:
+
+<CodeRef path="Kick/modules/kick_ui_controls/source/kick_layout.h" line={32} expect="appWidth  = 1024,">
+
+```cpp
+appWidth  = 1024,
+```
+
+</CodeRef>
+
+The height is 600 on the next line. The sketch:
+
+```cpp
+// kick_Hello.h   (design, not built, not compiled)
+namespace kick_ui
+{
+    class Hello : public juce::Component, public kick_ui::IScreen
+    {
+    public:
+        Hello() : kick_ui::IScreen( kick_ui::Screen::Hello ) {}
+
+        void paint( juce::Graphics& g ) override
+        {
+            g.fillAll( juce::Colours::black );
+            g.setColour( juce::Colours::white );
+            g.drawText( "Hello", getLocalBounds(), juce::Justification::centred );
+        }
+
+        bool requiresControlBar() override { return false; }
+    };
+}
+```
+
+**Step 3, registration.** Add one line to the batch in `KickHome`, next to the last real entry:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={240} expect="screenAdder( Screen::Inserts,">
+
+```cpp
+screenAdder( Screen::Inserts, std::make_unique<Inserts>() );
+```
+
+</CodeRef>
+
+Yours is `screenAdder( Screen::Hello, std::make_unique<Hello>() );`. The helper hides the component and stores it in the map (Module 4):
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={183} expect="screens_[Type] = std::move( Screen );">
+
+```cpp
+screens_[Type] = std::move( Screen );
+```
+
+</CodeRef>
+
+**Step 4, a way in.** Some code must fire the signal. The menu does it with a switch:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppMenuOptions.cpp" line={103} expect="case 15: signals::sigScreenOpen( kick_ui::Screen::MenuMidiControl ); break;">
+
+```cpp
+case 15: signals::sigScreenOpen( kick_ui::Screen::MenuMidiControl ); break;
+```
+
+</CodeRef>
+
+The menu is a four-column grid. It has 16 entries, one per case, with labels added in the constructor:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppMenuOptions.cpp" line={45} expect={`addOption( { "Midicontrol", "Midicontrol" }, "" );`}>
+
+```cpp
+addOption( { "Midicontrol", "Midicontrol" }, "" );
+```
+
+</CodeRef>
+
+I do not know whether a fifth row fits. The safe first experiment is to change an option you do not need: edit its label on a line like that one, and change its `case` to open `Screen::Hello`. Do that before you try to grow the grid.
+
+Test it in whatever stand-in you build for input (Option A from Module 5). Fire the open signal yourself from a key press and watch the screen appear. Remember the startup window from Module 4: screens besides the first are created after startup, so do not send your signal in the first moments after launch.
+
+<Aside type="caution" title="Design, not built">
+I have not compiled this screen. Two things I did not check: how CMake finds a new source file inside the `kick_ui` module, and whether a screen needs anything more than the four steps for the status bar. Check that the file lands in the build before you trust a clean compile.
+</Aside>
+
+Risk: low to medium. A bad screen can crash the app, but the app is not the OS.
+
+### Level 3: a custom OS image (design, not built)
+
+Module 3 showed that one recipe produces the whole system. The lowest-risk edits are in the overlay (text files copied onto the root filesystem) and the defconfig (the recipe).
+
+The recipe names its overlay folder:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={8} expect="BR2_ROOTFS_OVERLAY=">
+
+```text
+BR2_ROOTFS_OVERLAY="board/freescale/imx8mm_var_som/rootfs_overlay"
+```
+
+</CodeRef>
+
+Anything under that folder lands in the finished image at the same path. The app is started by a unit file:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/ktkick.service" line={9} expect="ExecStart= /bin/sh /usr/bin/kt_kick.sh">
+
+```text
+ExecStart= /bin/sh /usr/bin/kt_kick.sh
+```
+
+</CodeRef>
+
+That script waits, then starts the binary if it exists (Module 2):
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/usr/bin/kt_kick.sh" line={4} expect="sleep 15">
+
+```sh
+sleep 15
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/usr/bin/kt_kick.sh" line={5} expect="FILE=/usr/bin/KT_Kick">
+
+```sh
+FILE=/usr/bin/KT_Kick
+```
+
+</CodeRef>
+
+**Three edits, from smallest to biggest.**
+
+1. **Change the launcher.** Edit `kt_kick.sh` or the unit file in the overlay. For example, shorten the wait, or log to a file. A typo here can leave the box with no UI, so keep the original beside it.
+2. **Close the open door.** The Linux README says the shipped image has no root password and runs an SSH server:
+
+<CodeRef path="Linux/README.md" line={18} expect="no password">
+
+```md
+The image is a development build: the root account has **no password** and the Dropbear SSH server is
+```
+
+</CodeRef>
+
+   The defconfig enables Dropbear:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={117} expect="BR2_PACKAGE_DROPBEAR=y">
+
+```text
+BR2_PACKAGE_DROPBEAR=y
+```
+
+</CodeRef>
+
+   For a build you share, remove Dropbear or set a root password with the Buildroot option for it (general Buildroot knowledge; the upstream notes also say no such option is set). Choose your own secret and keep it out of the repository.
+3. **Install your app.** The launcher only checks whether the binary exists. The upstream notes say nothing in the Buildroot configs installs it, and I did not search every package to confirm that. So your image needs a post-build step or an external package that copies your build to `/usr/bin/KT_Kick`. The cross-compile route is in Module 3.
+
+Remember the Linux README line about the NXP packages:
+
+<CodeRef path="Linux/README.md" line={15} expect="NXP">
+
+```md
+first build. Some NXP packages (GPU, multimedia codecs, firmware) are downloaded under NXP's own
+```
+
+</CodeRef>
+
+Those packages carry NXP's terms, not the AGPL. If you plan to share an image file, read those terms first. I have not.
+
+**Flashing.** I am not going to give you a flashing recipe. The upstream notes list recovery paths and say none is verified on hardware, and a bad image on a unit with no second copy is a real risk. The updates and recovery module, coming later, is where that belongs. Until you have read it, build images only. Do not write one to a unit you cannot afford to lose.
+
+Risk: the edits are low. Flashing is high.
+
+## A recommended order of work
+
+Start where a mistake costs the least, and let each step prove the one before it.
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>1. Stand-ins</b><span class="layer layer-userspace">user space</span><br />Constants, audio device, serial stub, PktMgr rule.</div>
+    <div class="kd-step"><b>2. Simulator</b><span class="layer layer-message">message thread</span><br />Get a window. Feed the real dispatch signal.</div>
+    <div class="kd-step"><b>3. One effect</b><span class="layer layer-audio">audio thread</span><br />Test in AudIO alone, then in the app.</div>
+    <div class="kd-step"><b>4. One screen</b><span class="layer layer-userspace">user space</span><br />Four places. Fire the signal from a key.</div>
+    <div class="kd-step"><b>5. Image, build only</b><span class="layer layer-kernel">kernel</span><br />Overlay and defconfig. Do not flash.</div>
+    <div class="kd-step"><b>6. Hardware</b><span class="layer layer-hardware">hardware</span><br />Last, when you have a unit and a recovery plan.</div>
+  </div>
+  <figcaption>Left to right is the order I would work in. The simulator is the goal of step 2, and step 1 is the price of getting there.</figcaption>
+</figure>
+
+A few rules for the order:
+
+- **Simulator first means the goal, not the first task.** The first real work is the stand-ins. Do them one at a time and compile after each. When the first one lets one more module compile, you have evidence the method works.
+- **One change at a time.** Config switches interact (Module 3). A fork with five changes and one failure teaches you nothing.
+- **Pin your base.** Fork from the pinned commit, write that hash in your README, and move only when you choose to.
+- **Hardware is last.** The control surface firmware is absent, so you cannot change anything on that side. You can only speak the protocol (Module 5). With the stand-ins done, the first hardware contact should be reading only.
+
+## The AGPL-3.0, in plain words
+
+This section is general knowledge about the license text. It is not legal advice. I am not a lawyer. If real money, a product, or a company is involved, ask one. The text is the authority, and it is in the repository at `LICENSE`.
+
+The Music Tribe code in this repo says what it is under. The root README names the license per folder:
+
+<CodeRef path="README.md" line={42} expect="AGPL-3.0-or-later">
+
+```md
+| [`Kick/`](Kick) | Application | AGPL-3.0-or-later |
+```
+
+</CodeRef>
+
+The Linux image row is different. It is GPL-2.0, because that is Buildroot's license:
+
+<CodeRef path="README.md" line={45} expect="GPL-2.0 (Buildroot)">
+
+```md
+| [`Linux/`](Linux) | Buildroot Linux image | GPL-2.0 (Buildroot) |
+```
+
+</CodeRef>
+
+Every source file carries a header. This is the line that matters most, from the app's entry point:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={19} expect="SPDX-License-Identifier: AGPL-3.0-or-later">
+
+```cpp
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+```
+
+</CodeRef>
+
+The copyright line sits at the top of the same header:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={2} expect="Copyright (c) 2022 MUSIC Tribe">
+
+```cpp
+ * Copyright (c) 2022 MUSIC Tribe
+```
+
+</CodeRef>
+
+The words "or later" mean you may choose version 3 or any later version the Free Software Foundation publishes. The header says so in plain words:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={7} expect="GNU Affero General Public License as published">
+
+```cpp
+ * terms of the GNU Affero General Public License as published by the Free
+```
+
+</CodeRef>
+
+And it points to where the license lives:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={17} expect="https://www.gnu.org/licenses/">
+
+```cpp
+ * along with Kick. If not, see <https://www.gnu.org/licenses/>.
+```
+
+</CodeRef>
+
+### What it asks of you
+
+| What you do | What you owe | Where in the text |
+|---|---|---|
+| Build, modify and run it for yourself and share nothing | Nothing to publish | Section 2, `LICENSE` line 152 |
+| Give anyone a copy of your version (a friend, a download, a release) | The source of your version under the same license, the copyright and license notices left intact, and a notice that you changed it | Sections 4, 5 and 6, lines 185, 198, 233 |
+| Run a modified version that other people use over a network | Offer those users the source of your version | Section 13, line 540 |
+| Ship a consumer device with it | All of the above, plus the information needed to install modified versions on that device | "Installation Information", line 298 |
+
+Take the first row first. If you only tinker on your desk, the license asks nothing of you. That is the hobbyist case.
+
+The second row is where people slip. Giving a friend a built binary is conveying. The friend is owed the source for exactly what you gave them. A link to the upstream repo is not enough if your version differs. Publish your fork.
+
+The keep-the-notices rule lives in section 4 of `LICENSE`. It says to keep intact the notices that state the license applies, and the notices of the absence of any warranty, and to give recipients a copy of the license. Section 5 adds that your modified version must carry notices saying you modified it, with a date, and that the whole work must be licensed under the license. So: do not strip the headers from files you edit. Add a line saying what you changed and when.
+
+The network row is the AGPL's special trait. Section 13 starts like this:
+
+<CodeRef path="LICENSE" line={540} expect="13. Remote Network Interaction">
+
+```text
+  13. Remote Network Interaction; Use with the GNU General Public License.
+```
+
+</CodeRef>
+
+For the KICK that matters if you add a network feature that outsiders use, such as a web page or a remote control app that talks to your modified build. Then you must offer those users your source. A device on your own bench that nobody else touches is not that case. Whether a specific setup counts is a question for the text and, if it matters, a lawyer.
+
+The last row is about hardware. The license defines the information:
+
+<CodeRef path="LICENSE" line={298} expect="Installation Information">
+
+```text
+  "Installation Information" for a User Product means any methods,
+```
+
+</CodeRef>
+
+If you sold a consumer product running this firmware, owners would need what it takes to install their own modified builds. For a hobbyist sharing a repo and an image file, you are far from that. If you ever sell a device, talk to a lawyer first.
+
+### Three more points
+
+- **Your stand-ins join the work.** When you share a build, your `AudIO_constants`, `AudIO_juce` and the rest are part of the program. Plan to release them under the same license. Clean-room means you wrote them from the call sites, not from someone's closed copy.
+- **Other licenses stay in force.** Third-party code keeps its own license. The upstream README has a table of them. One entry is not the AGPL, and it is the one most likely to surprise you:
+
+<CodeRef path="Kick/README.md" line={49} expect="GPL-3.0-or-later">
+
+```md
+| ttymidi (Thiago Teixeira) | `apps/midiPort/src/ttymidi.c` | GPL-3.0-or-later |
+```
+
+</CodeRef>
+
+  The Airwindows effects are MIT licensed (Module 7). MIT asks that you keep the copyright notice. The AudIO README lists its own third-party table.
+- **Check what you reuse.** The root README shows product renders and photos. The AGPL covers the code. I do not know the license of the images. Do not copy them into your fork without checking.
+
+The course itself is under a different license. The lesson text and images are CC BY-SA 4.0, as the course README says. That is separate from the AGPL on the code the lessons quote. If you reuse a lesson, keep the credit and share your changes under the same terms. If you reuse the quoted code, the AGPL applies to it.
+
+## Trademarks
+
+A license for code is not a license for names. The AGPL lets you copy and change the code. It does not hand you the right to use someone's brand. The text even leaves room for the author to decline trademark rights:
+
+<CodeRef path="LICENSE" line={367} expect="Declining to grant rights under trademark law">
+
+```text
+    e) Declining to grant rights under trademark law for use of some
+```
+
+</CodeRef>
+
+The product name sits in the root README:
+
+<CodeRef path="README.md" line={5} expect="Behringer KICK">
+
+```md
+# Behringer KICK (BE 0700-AAM)
+```
+
+</CodeRef>
+
+Behringer and KICK belong to MUSIC Tribe. This course is not made by or endorsed by them, and the course README says so. My advice, and it is general advice, not legal advice:
+
+- **Do not ship a fork under their name or logo.** Pick your own name. Do not use "KICK" in the product name, the app title or an icon.
+- **Rename the identity strings in the build.** The build files carry company and product names, for example the simulator's company name:
+
+<CodeRef path="Kick/apps/kickem/CMakeLists.txt" line={5} expect="set(TargetCompany MUSICTribe)">
+
+```cmake
+set(TargetCompany MUSICTribe)
+```
+
+</CodeRef>
+
+  The main app sets a vendor string in its package settings too:
+
+<CodeRef path="Kick/apps/kick/CMakeLists.txt" line={163} expect="MusicTribe Innovation Pvt. Ltd.">
+
+```cmake
+set(CPACK_PACKAGE_VENDOR "MusicTribe Innovation Pvt. Ltd.")
+```
+
+</CodeRef>
+
+- **Say plainly what it is.** A sentence such as "an unofficial community fork of the open-source firmware for the Behringer KICK" states a fact. A name or logo that looks like theirs suggests they made it. The first is generally safer than the second.
+- **Do not reuse their artwork or product renders** unless a license says you can (see the point above).
+
+## How to contribute back, and how to share a fork
+
+**To upstream.** The root README invites pull requests with no membership needed:
+
+<CodeRef path="README.md" line={53} expect="fork the repository and open a pull request">
+
+```md
+- **Contribute:** fork the repository and open a pull request. No membership needed. See the
+```
+
+</CodeRef>
+
+The stand-ins are a good first contribution: a clean, licensed `AudIO_constants`, a small `AudIO_juce`, a serial class written from scratch. The repo cannot build without them. Be ready for the maintainers to say no or to have their own plan.
+
+**To this course.** Lessons are Markdown files in `src/content/docs/course/`. Read `STYLE.md` first. If I got something wrong, the best correction names the file and line at the pinned commit and says what you ran. If you build any stand-in and it compiles, tell me. That result is worth more than anything in this lesson, because I have none.
+
+**To share your fork.**
+
+- Put it in your own repository. Keep `LICENSE` and every file header.
+- In the README, say it is unofficial, name the upstream commit you forked from, list your changes, and list what you did not test.
+- Release the stand-in modules separately with a short interface note, so the next person does not start from zero.
+- Be honest about hardware. If you have not run it on a unit, write "not verified on hardware", as this course does.
+
+## What I still do not know
+
+Here are the open questions from the whole course. Some may never close from this repository alone.
+
+| Question | Why it matters | Where it came up |
+|---|---|---|
+| What does the camera and gesture feature run? No app code for it is in the tree | A fork cannot offer gestures | [Module 0](/kick-firmware-course/course/00-orientation/) |
+| What does the control surface firmware do, and can it be rebuilt? Its source is absent | Pads, knobs, LEDs and CV live behind it | [Module 1](/kick-firmware-course/course/01-hardware-map/) and [Module 5](/kick-firmware-course/course/05-talking-to-hardware/) |
+| How does the eMMC get its partitions? The layout lists two partitions but mount units name three | A custom image must match the real layout | [Module 2](/kick-firmware-course/course/02-boot/) |
+| Which compiler built the shipped firmware? The defconfig names no toolchain | Your SDK may not match | [Module 3](/kick-firmware-course/course/03-embedded-linux-buildroot/) |
+| Does the shipped image run one program or several? | Decides where a change lands | [Module 4](/kick-firmware-course/course/04-app-skeleton/) |
+| What are the real sample rate and block size? The constants module is absent | Latency and effect tuning depend on them | [Module 6](/kick-firmware-course/course/06-sound-engine-1/) and [Module 7](/kick-firmware-course/course/07-sound-engine-2/) |
+| Why is external MIDI sync never called? | A feature that looks present but is not wired | [Module 8](/kick-firmware-course/course/08-time/) |
+| Does any of the stand-in plan compile? | The whole fork depends on it | This module. I have not built it. |
+| Did the simulator ever compile against this tree? | It looks written for an older input path | This module. |
+
+For recovery and updates, the updates and recovery module is coming later.
+
+## Try it yourself
+
+This is a read-only checklist. It builds nothing, flashes nothing and needs no hardware. The goal is a one-page stand-in build plan in your own words, backed by lines you checked.
+
+With the upstream clone at the pinned commit, run these and write one sentence for each result.
+
+```bash
+cd Kick
+# 1. Confirm the three missing module names have no folder.
+find .. -name "AudIO_juce*" -o -name "AudIO_constants*" -o -name "juce_serialport*" -o -name "juce_modules.cmake"
+# 2. Who names them as dependencies?
+grep -rn "AudIO_juce\|AudIO_constants\|juce_serialport" modules --include=*.h --include=*.cmake --include=CMakeLists.txt
+# 3. Every use of the constants you must define.
+grep -rn "AUDIO_SAMPLE_RATE\|AUDIO_BLOCK_SIZE\|AUDIO_NUM_" modules
+grep -rhoE "(MIDI|POLYPHONY)::[A-Za-z_]+" modules | sort | uniq -c | sort -rn
+# 4. Is any of them defined?
+grep -rn "namespace MIDI\|namespace POLYPHONY\|define AUDIO_" modules ../AudIO
+# 5. Every use of the serial classes.
+grep -n "SerialPort" modules/input_events/input_events.cpp
+# 6. Does the simulator target generate config.h?
+grep -n "configure_file" apps/kickem/CMakeLists.txt apps/kick/CMakeLists.txt
+```
+
+Then fill in this table on paper, one row per hole:
+
+1. The hole's name and which modules name it.
+2. Each call site, with file and line.
+3. The type and the constraints each site forces (compile-time constant, unsigned, template argument).
+4. A value or design you would choose, and whether it has evidence or is a guess.
+5. A test that would tell you the stand-in is right.
+
+Finish with three answers.
+
+- Which hole would you write first, and why?
+- What is the smallest program that proves it, before you touch the UI?
+- What would make you stop and change the plan?
+
+<Aside type="note" title="Not verified on hardware">
+Every command above only reads files. I wrote them from the repository contents and did not run them. If a result differs from what I describe, trust your result, check you are on the pinned commit, and tell me.
+</Aside>
+
+## Check yourself
+
+<Quiz
+  items={[
+    {
+      q: 'Why does even the desktop simulator need the AudIO_constants and AudIO_juce stand-ins?',
+      options: [
+        'The simulator plays audio through AudIO_juce directly',
+        'The UI sits on modules that depend on common and audio_interface, which name those two missing modules',
+        'The simulator CMake file includes them by path',
+        'It does not need them; only the device app does',
+      ],
+      answer: 1,
+      why: 'kick_ui rests on the engine, and the engine rests on interface, which depends on common and audio_interface. Those two name AudIO_constants and AudIO_juce, so every app target needs them.',
+    },
+    {
+      q: 'How do you work out what a missing module must provide?',
+      options: [
+        'Download a copy from the original server',
+        'Guess from the module name and fix compile errors',
+        'Collect every call site, and record each name, its type, and any compile-time constraint it forces',
+        'Copy a similar unlicensed library',
+      ],
+      answer: 2,
+      why: 'The callers are the only specification you have. A template argument forces a compile-time constant. An array of 128 caps an index bound. Record each such constraint, and mark guesses as guesses.',
+    },
+    {
+      q: 'You modify the app, build it, and use it only on your own bench. What does the AGPL ask you to publish?',
+      options: [
+        'The full source, within 30 days',
+        'Nothing, because you have not conveyed it to anyone',
+        'Only the files you changed',
+        'A notice on a website',
+      ],
+      answer: 1,
+      why: 'Section 2 lets you make, run and propagate covered works that you do not convey, without conditions. The duties start when you give copies to others or let others use it over a network.',
+    },
+    {
+      q: 'You add a web page that lets other people control your modified build over the network. What does section 13 add?',
+      options: [
+        'Nothing, because a web page is not a copy',
+        'You must offer those users the source of your version',
+        'You must remove the license headers',
+        'You must register the page with the Free Software Foundation',
+      ],
+      answer: 1,
+      why: 'Section 13 says a modified version that supports remote interaction must offer the users interacting with it an opportunity to receive its Corresponding Source. That is the network clause that makes the AGPL different from the plain GPL.',
+    },
+    {
+      q: 'Can you ship your fork as "KICK Pro" with a look-alike icon, because the code is under the AGPL?',
+      options: [
+        'Yes, the AGPL covers the name',
+        'Yes, if you keep the copyright headers',
+        'No, a code license does not give you the right to use the brand; pick your own name',
+        'Only if you also publish the source',
+      ],
+      answer: 2,
+      why: 'Copyright license and trademark rights are separate. The code is free to change under the AGPL. The names Behringer and KICK belong to MUSIC Tribe. This is general advice, not legal advice.',
+    },
+  ]}
+/>
+
+## Words to know
+
+| Term | Meaning |
+|---|---|
+| Fork | Your own copy of a project that you change and keep separately |
+| Stand-in | Code you write to fill a missing piece, built from the needs of its callers |
+| Call site | A line of code that uses a name; the evidence for what a missing piece must offer |
+| JUCE module | A folder whose header holds a declaration block that lists its dependencies |
+| CPM | A CMake tool that downloads dependencies by name and tag |
+| Shim | A thin adapter that lets old code run in a new frame, like `AudioEffectX` |
+| Overlay | A folder copied onto the finished root filesystem in a Buildroot image |
+| Defconfig | The one-file recipe that tells Buildroot what to build |
+| AGPL-3.0 | A copyleft license. Sharing a modified version requires sharing its source, and it adds a clause for network use |
+| Convey | The license's word for giving others a copy of the program |
+| Corresponding Source | The source needed to build and install the version you gave out |
+| Installation Information | What an owner needs to install modified builds on a consumer device |
+| SPDX identifier | A short standard tag in a file header that names its license |
+| Trademark | A legal right in a name or logo, separate from the copyright license on code |
+| Design, not built | My label for a sketch that I wrote and did not compile |
+
+This is the last module. The updates and recovery module is coming later.

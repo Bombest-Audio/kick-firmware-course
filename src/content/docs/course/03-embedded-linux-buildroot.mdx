@@ -1,0 +1,635 @@
+---
+title: '3. Embedded Linux and Buildroot'
+description: How the whole operating system on the KICK is produced from one config file, what lives in each part of the Buildroot tree, and how the app gets cross-compiled and dropped into the image.
+---
+
+import { Image } from 'astro:assets';
+import { Aside } from '@astrojs/starlight/components';
+import CodeRef from '../../../components/CodeRef.astro';
+import Quiz from '../../../components/Quiz.astro';
+import hero from '../../../assets/heroes/m03-buildroot.png';
+
+<Image src={hero} alt="A recipe card feeds a small machine that stacks flat slabs on a conveyor into a glowing green cube." />
+
+**Module 3 of 12 &#183; about 30 minutes &#183; needs Modules 1 and 2**
+
+Module 2 ended with systemd starting an app. Where did that systemd come from? Who decided which audio tools are on the box, which kernel it runs, and how big the root partition is? One text file did. If you want a custom OS for the KICK, that file is where you start.
+
+By the end you will be able to read the build recipe, name what each folder in the board directory does, explain why you cannot just run `make` on a Mac to get the app, and say what you would change at each step of the pipeline.
+
+<Aside type="note" title="Analogy">
+A desktop distro is a supermarket. Somebody else stocked the shelves and you pick what you want. Buildroot is a recipe card plus a pantry list. You write down every ingredient and its exact version, and the machine cooks the whole meal from scratch. You get exactly what is on the card, nothing more.
+</Aside>
+
+## What Buildroot is
+
+Buildroot is a build system. You give it a config file. It downloads source code, compiles it all, and produces a complete Linux image: bootloader, kernel, and root filesystem. I am describing Buildroot from general knowledge here. The repository carries a full copy of the Buildroot tree, and its version is stamped in the top Makefile:
+
+<CodeRef path="Linux/buildroot/Makefile" line={95} expect="export BR2_VERSION := 2021.02.3">
+
+```make
+export BR2_VERSION := 2021.02.3
+```
+
+</CodeRef>
+
+So the KICK build is Buildroot 2021.02.3, copied into the repo.
+
+Why would an embedded product use this instead of installing a desktop distro on the board? Four reasons, all general knowledge:
+
+- Size. A desktop distro carries thousands of packages. The KICK needs a few dozen.
+- Reproducibility. The same config gives the same image. A distro changes under you with every update.
+- Control. You pick the init system, the kernel, the libraries, and nothing else shows up.
+- No package manager on the device. The image is the product. You rebuild it, you do not patch it in the field.
+
+The cost is time. Every build compiles everything. STACK.md in the upstream notes estimates one to two hours for a first build. That figure comes from the upstream notes, not from a build I ran.
+
+## The defconfig is the recipe
+
+Buildroot reads one file named by `make <name>_defconfig`. For the KICK it is `KTKick_defconfig`. The helper script runs it first and then builds:
+
+<CodeRef path="Linux/builder.sh" line={9} expect="make KTKick_defconfig">
+
+```sh
+make KTKick_defconfig && \
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/builder.sh" line={10} expect="make -j4">
+
+```sh
+make -j4 && \
+```
+
+</CodeRef>
+
+`make -j4` means "run four jobs at once". Everything else is in the defconfig. I will walk through it in the order the build uses it.
+
+### Architecture and toolchain
+
+The first line sets the CPU family. The i.MX 8M Mini from Module 1 is a 64-bit ARM chip:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={1} expect="BR2_aarch64=y">
+
+```text
+BR2_aarch64=y
+```
+
+</CodeRef>
+
+The next line says the compiler is external:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={2} expect="BR2_TOOLCHAIN_EXTERNAL=y">
+
+```text
+BR2_TOOLCHAIN_EXTERNAL=y
+```
+
+</CodeRef>
+
+External means Buildroot does not compile a compiler. It uses a prebuilt one. I read the whole defconfig and found no line naming which toolchain or where to download it. See the open question at the end of this section.
+
+### Init system and the overlay hook
+
+systemd is the init system, as Module 2 showed:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={5} expect="BR2_INIT_SYSTEMD=y">
+
+```text
+BR2_INIT_SYSTEMD=y
+```
+
+</CodeRef>
+
+The serial console login goes to a specific UART:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={6} expect={`BR2_TARGET_GENERIC_GETTY_PORT="ttymxc3"`}>
+
+```text
+BR2_TARGET_GENERIC_GETTY_PORT="ttymxc3"
+```
+
+</CodeRef>
+
+### The kernel and its pin
+
+The kernel is not Linus Torvalds' tree. It is a vendor fork, fetched from Git and pinned to one commit:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={13} expect="https://github.com/varigit/linux-imx.git">
+
+```text
+BR2_LINUX_KERNEL_CUSTOM_REPO_URL="https://github.com/varigit/linux-imx.git"
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={14} expect="920c302cfe05d805f97be9635af411e67c888051">
+
+```text
+BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="920c302cfe05d805f97be9635af411e67c888051"
+```
+
+</CodeRef>
+
+`varigit` is Variscite's GitHub account. They make the system-on-module Module 1 described, and the fork carries their board support. A commit hash is an exact snapshot. The build cannot drift to a newer kernel by accident.
+
+Three more lines point at files inside the repo: a patch folder, a kernel config, and a boot logo.
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={15} expect="BR2_LINUX_KERNEL_PATCH">
+
+```text
+BR2_LINUX_KERNEL_PATCH="board/freescale/imx8mm_var_som/patches/linux/"
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={17} expect="linux-configs/Linux-defconfig">
+
+```text
+BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig"
+```
+
+</CodeRef>
+
+The device tree names the four board variants that get built:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={21} expect="imx8mm-var-som-symphony-legacy-m4">
+
+```text
+BR2_LINUX_KERNEL_INTREE_DTS_NAME="freescale/imx8mm-var-som-symphony freescale/imx8mm-var-som-symphony-legacy freescale/imx8mm-var-som-symphony-legacy-m4 freescale/imx8mm-var-som-symphony-m4"
+```
+
+</CodeRef>
+
+### U-Boot and trusted firmware pins
+
+Module 2 named the bootloader stages. Here is where their source comes from. U-Boot is another Variscite fork, pinned the same way:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={134} expect="https://github.com/varigit/uboot-imx.git">
+
+```text
+BR2_TARGET_UBOOT_CUSTOM_REPO_URL="https://github.com/varigit/uboot-imx.git"
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={135} expect="46d384f517a2dbe63c6161d2ecfd964fdc08bf89">
+
+```text
+BR2_TARGET_UBOOT_CUSTOM_REPO_VERSION="46d384f517a2dbe63c6161d2ecfd964fdc08bf89"
+```
+
+</CodeRef>
+
+The ARM trusted firmware (the `bl31` from Module 2) has its own fork and its own pin:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={128} expect="e5884084510a2a88101351bed3710860c28c0657">
+
+```text
+BR2_TARGET_ARM_TRUSTED_FIRMWARE_CUSTOM_REPO_VERSION="e5884084510a2a88101351bed3710860c28c0657"
+```
+
+</CodeRef>
+
+### Package highlights
+
+Between the kernel and the bootloader sit the packages. Three groups matter for an audio box. Sound plumbing comes first: the ALSA command-line tools and the JACK audio server.
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={23} expect="BR2_PACKAGE_ALSA_UTILS=y">
+
+```text
+BR2_PACKAGE_ALSA_UTILS=y
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={35} expect="BR2_PACKAGE_JACK2=y">
+
+```text
+BR2_PACKAGE_JACK2=y
+```
+
+</CodeRef>
+
+Next is graphics: Weston, the display server from Module 2, plus the NXP GPU 2D library that its `use-g2d` setting depends on.
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={53} expect="BR2_PACKAGE_WESTON=y">
+
+```text
+BR2_PACKAGE_WESTON=y
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={88} expect="BR2_PACKAGE_IMX_GPU_G2D=y">
+
+```text
+BR2_PACKAGE_IMX_GPU_G2D=y
+```
+
+</CodeRef>
+
+The third group is NXP's i.MX vendor stack, including firmware blobs:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={82} expect="BR2_PACKAGE_FREESCALE_IMX=y">
+
+```text
+BR2_PACKAGE_FREESCALE_IMX=y
+```
+
+</CodeRef>
+
+The same list also pulls in an X server, xterm and several X11 libraries (lines 58 to 78). I do not know which of those the KICK app needs at runtime. That is a good place to look if you want a smaller image, and I have not tested what breaks if they go.
+
+The root filesystem is built as ext4 with a fixed size:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={123} expect={`BR2_TARGET_ROOTFS_EXT2_SIZE="762M"`}>
+
+```text
+BR2_TARGET_ROOTFS_EXT2_SIZE="762M"
+```
+
+</CodeRef>
+
+<Aside type="caution" title="Open question">
+The defconfig says the toolchain is external but names no URL, path, or version. The upstream notes say to check `make menuconfig` for it. I could not tell from the repository which compiler built the shipping firmware. If you build your own image, you will have to pick one and record which.
+</Aside>
+
+## The board directory tour
+
+Everything specific to this product lives in one folder, `Linux/buildroot/board/freescale/imx8mm_var_som/`. The defconfig points into it three times already. Here is the map.
+
+| Path | What it holds |
+|---|---|
+| `linux-configs/Linux-defconfig` | The kernel's own build options |
+| `patches/linux/` | Three small edits applied to the pinned kernel |
+| `patches/u-boot/` | One edit applied to the pinned U-Boot |
+| `u-boot/imx8mm_var_dart_defconfig` | The U-Boot build options (Module 2 cited its boot delay) |
+| `rootfs_overlay/` | Files copied on top of the built root filesystem |
+| `genimage.cfg.sd` and `genimage.cfg.emmc.partiton.table` | Partition layouts for the images |
+| `imx8-bootloader-prepare.sh` and `post-image.sh` | Scripts that run after the build |
+
+### The kernel config
+
+A kernel config is a long list of on/off switches for features. I will point at one that matters for audio. The kernel is built as preemptible:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={5} expect="CONFIG_PREEMPT=y">
+
+```text
+CONFIG_PREEMPT=y
+```
+
+</CodeRef>
+
+Preemptible means a high-priority task can interrupt kernel code that is already running. That helps keep audio callbacks on time. This is general kernel knowledge. I have not measured the KICK's latency, and a fully real-time kernel would use a different option.
+
+### The patches
+
+The pinned fork is close to what the board needs but not exact, so the repo carries small patches. One of them edits the Goodix touchscreen driver, the same chip Module 2 met in the device tree:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/patches/linux/003.goodix.c.patch" line={1} expect="drivers/input/touchscreen/goodix.c">
+
+```text
+diff --git a/drivers/input/touchscreen/goodix.c b/drivers/input/touchscreen/goodix.c
+```
+
+</CodeRef>
+
+The U-Boot patch is bigger. It adds a new C file to the board directory, and that file reads two compressed images from an SD card and writes them to the eMMC:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/patches/u-boot/001-sd-boot-burn-emmc.patch" line={9} expect="burn_emmc_image.o">
+
+```text
++obj-y += burn_emmc_image.o
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/patches/u-boot/001-sd-boot-burn-emmc.patch" line={71} expect="rootfs.ext4.gz">
+
+```text
++		if (fat_read_file("rootfs.ext4.gz", (unsigned char *)addr, 0, 0, &size) < 0){
+```
+
+</CodeRef>
+
+So an SD card carrying `rootfs.ext4.gz` can install the OS onto the internal storage. The full flashing story belongs in the updates and recovery module, coming later. The installer also rewrites the partition table after it writes the rootfs, so I would not run it on a unit that holds data you care about (not verified on hardware). For now, note that this is board-specific code living in a patch, not in a package.
+
+### The rootfs overlay
+
+The defconfig names one folder as the overlay:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={8} expect="BR2_ROOTFS_OVERLAY=">
+
+```text
+BR2_ROOTFS_OVERLAY="board/freescale/imx8mm_var_som/rootfs_overlay"
+```
+
+</CodeRef>
+
+The rule, from general Buildroot knowledge: after all packages are installed into the target root, Buildroot copies the overlay folder on top, file for file. Same path means your file wins. New paths just appear.
+
+That is how KICK adds its own pieces without touching Buildroot's packages. The overlay holds the systemd units from Module 2, the Weston config, the audio config and the launcher script. For example, `ktkick.service` in the overlay is what runs the launcher:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/ktkick.service" line={9} expect="/usr/bin/kt_kick.sh">
+
+```text
+ExecStart= /bin/sh /usr/bin/kt_kick.sh
+```
+
+</CodeRef>
+
+And the launcher expects the app to already sit at `/usr/bin/KT_Kick`:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/usr/bin/kt_kick.sh" line={5} expect="FILE=/usr/bin/KT_Kick">
+
+```sh
+FILE=/usr/bin/KT_Kick
+```
+
+</CodeRef>
+
+Notice what the image does not contain from the build above: the app binary itself. The overlay in this repository has the launcher, but I found no `KT_Kick` file in it. The app comes from a separate build, which is the next section.
+
+The overlay also ships a small config that prepares writable layers for `/etc` and `/var`:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/kick/overlay-dirs.conf" line={4} expect="/media/kickstorage/overlay/etc/upper">
+
+```text
+d /media/kickstorage/overlay/etc/upper 0755 root root -
+```
+
+</CodeRef>
+
+The name "overlay" is overloaded here. The Buildroot rootfs overlay is a build-time copy. The `overlay` directories on `kickstorage` are a runtime layering trick (general Linux: a read-only lower layer plus a writable upper layer). They are two different things that share a word. I have not traced the mount units far enough to explain the runtime layering fully, so I leave it there.
+
+### genimage and the post-image scripts
+
+When Buildroot finishes, it runs the post-image scripts named in the defconfig:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={9} expect="imx8-bootloader-prepare.sh board/freescale/imx8mm_var_som/post-image.sh">
+
+```text
+BR2_ROOTFS_POST_IMAGE_SCRIPT="board/freescale/imx8mm_var_som/imx8-bootloader-prepare.sh board/freescale/imx8mm_var_som/post-image.sh"
+```
+
+</CodeRef>
+
+`post-image.sh` fills in a template, then calls `genimage`, a tool that lays out partitions and writes disk images. The script runs it with the built target tree as input:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/post-image.sh" line={127} expect="genimage \">
+
+```sh
+genimage \
+```
+
+</CodeRef>
+
+It runs twice. The first run uses the eMMC partition table template and then compresses the root filesystem:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/post-image.sh" line={140} expect="gzip -f -9 ${BINARIES_DIR}/rootfs.ext4">
+
+```sh
+gzip -f -9 ${BINARIES_DIR}/rootfs.ext4
+```
+
+</CodeRef>
+
+The second run builds the SD-card layout from `genimage.cfg.sd`:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/post-image.sh" line={146} expect="genimage.cfg.sd">
+
+```sh
+board/freescale/imx8mm_var_som/genimage.cfg.sd > ${GENIMAGE_CFG}
+```
+
+</CodeRef>
+
+Inside that file, one image bundles the compressed eMMC pieces for the SD installer, and another is the Linux boot partition holding the kernel and device trees:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/genimage.cfg.sd" line={14} expect="emmc.gpt.gz">
+
+```text
+emmc.gpt.gz,
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/genimage.cfg.sd" line={73} expect="image sdcard_linux.img">
+
+```text
+image sdcard_linux.img {
+```
+
+</CodeRef>
+
+## The pipeline as a picture
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>KTKick_defconfig</b><span class="layer layer-userspace">recipe</span><br />One file. Names every pin, package and path.</div>
+    <div class="kd-step"><b>Toolchain</b><span class="layer layer-hardware">host</span><br />External cross-compiler. Runs on the build PC, makes ARM code.</div>
+    <div class="kd-step"><b>Kernel + U-Boot + ATF</b><span class="layer layer-kernel">kernel</span><span class="layer layer-bootloader">bootloader</span><br />Fetched from pinned forks, patched, compiled.</div>
+    <div class="kd-step"><b>Packages</b><span class="layer layer-userspace">user space</span><br />ALSA, JACK, Weston, NXP libraries, systemd.</div>
+    <div class="kd-step"><b>Root filesystem</b><span class="layer layer-userspace">user space</span><br />Packages plus the rootfs overlay copied on top.</div>
+    <div class="kd-step"><b>genimage</b><span class="layer layer-storage">storage</span><br />Writes partitions into SD and eMMC images.</div>
+  </div>
+  <figcaption>Left to right is build order. The app binary is not in this chain. It enters from a separate cross-compile and is copied into <code>/usr/bin</code>.</figcaption>
+</figure>
+
+## Cross-compiling the app
+
+Here is the fact that surprises people the first time. The machine that builds the code is not the machine that runs it. The build PC is the host. The KICK is the target. They use different CPUs, so code compiled on the host will not run on the target.
+
+If you ran a normal compiler on your Mac, you would get an Apple-silicon or Intel program. The KICK's i.MX 8M Mini cannot execute it. You also would not have the right libraries: the headers for ALSA, the GPU library and the Wayland client must match what is on the box.
+
+A cross-compiler runs on the host and emits target code. A toolchain file tells CMake to use it. The pieces together are often called an SDK, short for software development kit: compiler, headers and libraries, all matched to one image. The upstream notes say Buildroot can produce one with `make sdk`. That command does not appear in any script I read, so I mark it as notes only.
+
+The repo's helper script shows the contract. It reads the toolchain file from an environment variable and configures CMake with it:
+
+<CodeRef path="Kick/buildApp.sh" line={2} expect="toolChainfile=${TOOLCHAIN_FILE}">
+
+```sh
+toolChainfile=${TOOLCHAIN_FILE}
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/buildApp.sh" line={6} expect="-DCMAKE_TOOLCHAIN_FILE=${toolChainfile}">
+
+```sh
+cmake -GNinja -DCMAKE_BUILD_TYPE=$1 -DCMAKE_TOOLCHAIN_FILE=${toolChainfile}  ../../
+```
+
+</CodeRef>
+
+Then Ninja does the compile, and the result is copied up to the repo root under the name the launcher expects:
+
+<CodeRef path="Kick/buildApp.sh" line={7} expect="ninja -j20">
+
+```sh
+ninja -j20
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/buildApp.sh" line={8} expect="cp KT_Kick ../../">
+
+```sh
+cp KT_Kick ../../
+```
+
+</CodeRef>
+
+The continuous-integration script shows the same idea with a fixed path. It unpacks an SDK tarball and points CMake at the toolchain file inside it:
+
+<CodeRef path="Kick/CI/azure_build.sh" line={31} expect="aarch64-buildroot-linux-gnu_sdk-buildroot.tar.gz">
+
+```sh
+TAR_FILE="aarch64-buildroot-linux-gnu_sdk-buildroot.tar.gz"
+```
+
+</CodeRef>
+
+The upstream notes add two cautions. The prebuilt SDK tarball was removed from the open release, and `buildApp.sh` copies a file named `KT_Kick` that the CMake targets may not produce under that name, so you may need to rename the output yourself. Neither point is something I ran.
+
+How does `KT_Kick` reach the device? From the upstream notes, two ways: copy it over SSH to a running unit, or bake it into an image. The repo has a transfer script for the first. I have not tried either.
+
+<Aside type="caution" title="Not verified on hardware">
+Nothing in this lesson comes from a build I ran. I read the config and scripts at the pinned commit. I do not claim that `make KTKick_defconfig && make` finishes, that the image boots, or that the app starts. The upstream notes also list missing private repos and removed assets that block a clean build. Check the upstream notes before you plan a build.
+</Aside>
+
+## Why pinned forks cut both ways
+
+Every source here is pinned to a commit: kernel, U-Boot, trusted firmware. That gives you three things.
+
+- Same input, same output. A colleague who builds next year gets the same kernel.
+- No surprise regressions. An upstream change cannot break audio overnight.
+- A known base to patch. The three kernel patches apply cleanly because the base never moves.
+
+It costs you too. The kernel is a vendor fork at one frozen point. Security fixes and new drivers from newer kernels do not arrive unless somebody rebases the fork and re-tests the board. A frozen kernel also ages out of what the compiler and tooling support. That is general embedded experience, not something this repo proves, but the pin on line 14 of the defconfig is the evidence that the freeze exists.
+
+For a custom OS, the decision is yours: stay frozen and safe, or move the pin and own the testing.
+
+## Where a custom OS changes things
+
+Each step in the picture has a place where you can make a different choice.
+
+| Step | What you could change | Risk to watch |
+|---|---|---|
+| Defconfig | Drop the X server and unused packages. Add your own. | Removing something the app links against. Rebuild and boot-test. |
+| Toolchain | Pick and record a specific compiler. | Mismatch with the app's SDK. Build both from the same toolchain. |
+| Kernel pin | Move to a newer Variscite commit. | The three patches may no longer apply. |
+| Kernel config | Change preemption model, drivers, logo. | Config switches interact. Change one at a time. |
+| U-Boot | Restore a boot delay for recovery work. | You lose the fast-boot behavior from Module 2. |
+| Rootfs overlay | Replace units, scripts and configs. | A typo in a unit can leave the box without a UI. |
+| genimage | Resize partitions, change the layout. | The mount units must still point at real partitions (see Module 2's open question). |
+
+The overlay is the lowest-risk place to start. You change text files, rebuild, and the diff is small.
+
+## Try it yourself
+
+This is a read-only walk-through. It runs nothing heavy and builds nothing.
+
+```bash
+cd Linux/buildroot
+grep -n "REPO_VERSION" configs/KTKick_defconfig
+grep -n "^BR2_PACKAGE_.*=y" configs/KTKick_defconfig | wc -l
+ls board/freescale/imx8mm_var_som/patches/linux
+ls board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system
+cd ../../Kick && cat buildApp.sh
+```
+
+Then answer on paper:
+
+1. Which three lines pin external source by commit, and what does each fetch?
+2. Pick one file in the overlay. What path will it have on the finished device?
+3. In `buildApp.sh`, which line makes this a cross-compile and not a native one?
+4. If you wanted a smaller image, which defconfig lines would you test removing first, and what would you check after each?
+
+<Aside type="note" title="Not verified on hardware">
+Every command above only reads files. I wrote them from the repository contents and did not run them against a built tree.
+</Aside>
+
+## Check yourself
+
+<Quiz
+  items={[
+    {
+      q: 'What is the main job of KTKick_defconfig?',
+      options: [
+        'It is the compiled firmware that gets flashed',
+        'It is the single recipe that tells Buildroot what to fetch, build and package',
+        'It stores the user’s project files',
+        'It is the app’s CMake file',
+      ],
+      answer: 1,
+      why: 'Buildroot reads the defconfig and builds the bootloader, kernel and root filesystem from it. Nothing in it is compiled output.',
+    },
+    {
+      q: 'Why can you not run a normal build on a Mac and copy the result to the KICK?',
+      options: [
+        'The KICK has no filesystem',
+        'The Mac cannot run CMake',
+        'The Mac builds for its own CPU, and the KICK has a different 64-bit ARM chip and different libraries',
+        'Ninja only works on Linux',
+      ],
+      answer: 2,
+      why: 'Host and target differ. A cross-compiler plus a matching toolchain file produces code for the target.',
+    },
+    {
+      q: 'What does the rootfs overlay do?',
+      options: [
+        'Mounts a writable layer at runtime on every boot',
+        'Copies its files on top of the built root filesystem at build time',
+        'Compresses the kernel',
+        'Replaces U-Boot',
+      ],
+      answer: 1,
+      why: 'The Buildroot overlay is a build-time copy. The runtime overlay directories on kickstorage are a separate thing that shares the word.',
+    },
+    {
+      q: 'What is the main trade-off of pinning the kernel to one commit?',
+      options: [
+        'Builds become random',
+        'Builds are reproducible, but the kernel stays frozen and misses newer fixes unless someone rebases it',
+        'The kernel cannot be patched',
+        'The app cannot start',
+      ],
+      answer: 1,
+      why: 'A pin gives repeatable output and a stable base for patches. The cost is that updates from newer kernels are your job.',
+    },
+    {
+      q: 'Where does the KT_Kick binary come from?',
+      options: [
+        'It is built by Buildroot as a package',
+        'It is already in the rootfs overlay',
+        'It is built by a separate CMake and Ninja cross-compile and then copied to /usr/bin',
+        'It is downloaded by U-Boot',
+      ],
+      answer: 2,
+      why: 'buildApp.sh produces KT_Kick outside Buildroot. The overlay only ships the launcher script that expects it at /usr/bin/KT_Kick.',
+    },
+  ]}
+/>
+
+## Words to know
+
+| Term | Meaning |
+|---|---|
+| Buildroot | A build system that produces a complete embedded Linux image from a config file |
+| Defconfig | A short config file listing only the options that differ from the defaults |
+| Cross-compile | Compile on one kind of machine (host) for another (target) |
+| Host / target | The machine that builds, and the machine that runs the result |
+| Toolchain | The compiler, linker and C library used to build code |
+| SDK | A toolchain plus matching headers and libraries for one image |
+| Toolchain file | A CMake file that points the build at a cross-compiler |
+| Pin | Fixing a dependency to an exact version or commit hash |
+| Fork | A copy of a project that its owner maintains separately |
+| Patch | A small diff applied to source code during the build |
+| Rootfs overlay | A folder copied onto the built root filesystem at build time |
+| genimage | A tool that writes partitions and disk images from a layout file |
+| Ninja | A fast build runner that CMake can drive |
+
+Next: Module 4 (coming soon).

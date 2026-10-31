@@ -1,0 +1,474 @@
+---
+title: '11. The camera'
+description: What the repository proves about the KICK's AI camera (a kernel driver and nothing else), how a Linux camera works, whether the chip can afford vision next to the audio engine, and a design sketch for a gesture-to-sound pipeline.
+---
+
+import { Image } from 'astro:assets';
+import { Aside } from '@astrojs/starlight/components';
+import CodeRef from '../../../components/CodeRef.astro';
+import Quiz from '../../../components/Quiz.astro';
+import hero from '../../../assets/heroes/m11-camera.png';
+
+<Image src={hero} alt="A single glowing green lens-like ring watching a small hand shape made of dots." />
+
+**Module 11 of 12 &#183; about 35 minutes &#183; needs Modules 2 and 6**
+
+The first line of the feature list says the KICK has an AI camera for gesture control. This is the one module where I have to teach you something that is mostly not in the source. The repository contains the plumbing for a camera and none of the code that would use one. I want you to leave able to say exactly where that line falls, and able to design what goes on the far side of it.
+
+By the end you will be able to separate "the kernel can talk to a camera" from "the product does gesture control", explain how a Linux camera delivers frames, do a back-of-envelope CPU budget for vision next to the audio engine, and sketch a camera-to-sound pipeline that does not break the real-time rules from Module 6.
+
+<Aside type="note" title="Analogy">
+A house can have a doorbell wire in the wall, a hole cut for the button, and a power line run to it. None of that means there is a doorbell. The wire is the kernel driver. The button, the chime and the code that rings it are what is missing.
+</Aside>
+
+## What the README promises
+
+<CodeRef path="README.md" line={15} expect="AI camera for gesture control">
+
+```text
+- AI camera for gesture control
+```
+
+</CodeRef>
+
+That is the only place the feature is named in the whole repository. It sits in the "Key features" list, between the product photo and the connection tables. Everything below is me checking what the source behind that sentence actually contains.
+
+## What exists and what does not
+
+| Layer | In the repository? | Evidence |
+|---|---|---|
+| Kernel camera drivers (sensor, CSI link, capture) | Yes, enabled in the kernel config | Lines cited in the next section |
+| Device tree node that wires a camera to the chip | Not in this repository | The in-repo device tree patch has no camera entry. The full tree lives in a forked kernel that the build downloads |
+| Userspace camera tools (v4l-utils, GStreamer, OpenCV) | No | Not in the Buildroot recipe |
+| App code that opens a camera | No | Repo-wide search, shown in the lab |
+| An inference runtime (TFLite, ONNX) or a model file | No | Same search |
+| Gesture-to-audio mapping | No | Same search |
+
+So the honest summary is: the operating system can be told to support a camera, and the product code that would use one is not here. I cannot tell you from this repository whether the shipped KICK has a camera module fitted, whether the feature runs, or what runs it. **Not verified on hardware.** The box may have a closed component that was left out of the public release, or the feature may be unfinished. I only know what the source shows.
+
+## The kernel side, line by line
+
+The kernel config the build uses is named in the Buildroot recipe:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={17} expect="linux-configs/Linux-defconfig">
+
+```text
+BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig"
+```
+
+</CodeRef>
+
+A second, much larger file named `imx8mm_var_linux_defconfig` sits in the same folder. The recipe does not point at it, so I ignore it here.
+
+Camera support starts with the general media framework. `MEDIA_SUPPORT` switches on the whole video-and-radio subsystem, `MEDIA_CAMERA_SUPPORT` turns on camera drivers, and `MEDIA_CONTROLLER` lets userspace see how the pieces inside a camera pipeline are connected:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={357} expect="CONFIG_MEDIA_CAMERA_SUPPORT=y">
+
+```text
+CONFIG_MEDIA_CAMERA_SUPPORT=y
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={360} expect="CONFIG_MEDIA_CONTROLLER=y">
+
+```text
+CONFIG_MEDIA_CONTROLLER=y
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={361} expect="CONFIG_VIDEO_V4L2_SUBDEV_API=y">
+
+```text
+CONFIG_VIDEO_V4L2_SUBDEV_API=y
+```
+
+</CodeRef>
+
+The last one exposes the camera's inner parts (sensor, receiver) as separate device nodes so a program can configure each one. Now the parts that are specific to this chip. There is a MIPI CSI-2 receiver driver, the capture driver that turns the receiver's output into frames, and a driver for one named sensor, the OmniVision OV5640:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={368} expect="CONFIG_IMX8_MIPI_CSI2_YAV=m">
+
+```text
+CONFIG_IMX8_MIPI_CSI2_YAV=m
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={370} expect="CONFIG_MXC_MIPI_CSI=y">
+
+```text
+CONFIG_MXC_MIPI_CSI=y
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={371} expect="CONFIG_MXC_CAMERA_OV5640_MIPI_V2=y">
+
+```text
+CONFIG_MXC_CAMERA_OV5640_MIPI_V2=y
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={373} expect="CONFIG_VIDEO_OV5640=y">
+
+```text
+CONFIG_VIDEO_OV5640=y
+```
+
+</CodeRef>
+
+Two things to read carefully here. First, `=y` means built into the kernel image and `=m` means built as a loadable module. The CSI-2 receiver on line 368 is a module, so something has to load it. Second, the OV5640 shows up twice: once as a vendor capture-stack driver (`MXC_CAMERA_OV5640_MIPI_V2`) and once as the mainline Linux driver (`VIDEO_OV5640`). Having both is a general-knowledge sign that the config was copied from NXP and Variscite reference kernels and not pruned. Which one would bind to a real sensor depends on the device tree, which is not in this repository. I cannot resolve that from here.
+
+The line that looks like a camera but is not one: a USB webcam path.
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={364} expect="CONFIG_USB_VIDEO_CLASS=m">
+
+```text
+CONFIG_USB_VIDEO_CLASS=m
+```
+
+</CodeRef>
+
+UVC (USB Video Class) is the standard driver for plug-in USB webcams. With it, a camera on a USB-A port would show up as a video device. That is a different route from the sensor on the ribbon cable. Do not confuse it with this one, which points the other way:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={629} expect="CONFIG_USB_CONFIGFS_F_UVC=y">
+
+```text
+CONFIG_USB_CONFIGFS_F_UVC=y
+```
+
+</CodeRef>
+
+That is the UVC *gadget* function. It lets the KICK pretend to be a webcam to a computer it is plugged into. It has nothing to do with the KICK looking at your hand.
+
+One more related option. The kernel is built to manage a second, small processor on the chip:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={717} expect="CONFIG_IMX_REMOTEPROC=y">
+
+```text
+CONFIG_IMX_REMOTEPROC=y
+```
+
+</CodeRef>
+
+`remoteproc` is the Linux framework for loading firmware onto another core and talking to it. The recipe also builds device trees with an `-m4` suffix:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={21} expect="imx8mm-var-som-symphony-m4">
+
+```text
+BR2_LINUX_KERNEL_INTREE_DTS_NAME="freescale/imx8mm-var-som-symphony freescale/imx8mm-var-som-symphony-legacy freescale/imx8mm-var-som-symphony-legacy-m4 freescale/imx8mm-var-som-symphony-m4"
+```
+
+</CodeRef>
+
+The i.MX 8M Mini has a Cortex-M4 core next to its four Cortex-A53 application cores (general NXP datasheet knowledge, not from this repository). Those `-m4` trees are a hint that someone planned to run firmware there. They are not proof that the camera uses it, and a Cortex-M4 is far too small for a vision model. I list it as an open question, not a finding.
+
+### The device tree
+
+Module 1 and Module 2 showed that the repository carries a patch to the device tree for the touchscreen and the clock chip. I searched that patch, and the rest of the board folder, for `ov5640`, `csi`, `camera` and `mipi`. Nothing matched. A device tree node that connects a sensor to the CSI receiver has to exist somewhere for the drivers above to bind. The recipe says where: it builds trees named `imx8mm-var-som-symphony*` out of the forked kernel it downloads, pinned by commit (Module 2). I did not fetch that fork. So the question "does the shipped device tree declare a camera" is open. **Not verified on hardware.**
+
+### Userspace packages
+
+Camera tools live in userspace, so check the Buildroot recipe. It does include FFmpeg with the scaling library:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={31} expect="BR2_PACKAGE_FFMPEG=y">
+
+```text
+BR2_PACKAGE_FFMPEG=y
+```
+
+</CodeRef>
+
+FFmpeg can read V4L2 devices, but nothing in the repo asks it to, and I did not find a reason for it in the camera code, because there is none. A search of the recipe for `v4l`, `gstreamer`, `opencv`, `tflite`, `onnx` and `libcamera` found no enabled package. Buildroot itself ships packages for several of those, in `Linux/buildroot/package/`, but a package folder existing is not the same as the recipe turning it on.
+
+## How a Linux camera works
+
+Plain model first. A camera is a stream of pictures that arrives whether or not anyone is ready for it. The job of the software is to catch each picture before the next one pushes it out.
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>Sensor</b><span class="layer layer-hardware">hardware</span><br />Turns light into numbers, row by row, many times a second.</div>
+    <div class="kd-step"><b>MIPI CSI-2 link</b><span class="layer layer-hardware">hardware</span><br />A few fast wire pairs from sensor to chip.</div>
+    <div class="kd-step"><b>CSI receiver</b><span class="layer layer-kernel">kernel</span><br />Driver writes each frame into a memory buffer.</div>
+    <div class="kd-step"><b>/dev/video0</b><span class="layer layer-kernel">kernel</span><br />V4L2 device node. The door userspace uses.</div>
+    <div class="kd-step"><b>Your program</b><span class="layer layer-userspace">user space</span><br />Takes a buffer, uses it, hands it back.</div>
+  </div>
+  <figcaption>The path of one frame. Same layer colors as the rest of the course. The names are general Linux knowledge; the drivers behind the kernel boxes are the config lines above.</figcaption>
+</figure>
+
+**The sensor.** The OV5640 is a roughly five-megapixel sensor (general knowledge). It exposes its pixels as a stream and has a small I2C control port for settings such as exposure and frame size. You met I2C in Module 1.
+
+**The MIPI CSI-2 link.** CSI-2 is a camera-specific serial standard. A handful of data lanes carry pixels at high speed to the chip, and a separate clock pair keeps the receiver in step. It is built for one job: move a lot of pixels cheaply, with few pins. The i.MX 8M Mini has such a receiver (NXP datasheet, as I remember it, not verified here).
+
+**ISP or no ISP.** An image signal processor is dedicated hardware that cleans up the sensor's raw output: it fixes color, noise, exposure and lens defects, and does it without touching the CPU. As far as I recall from the NXP datasheet, the 8M Mini has no ISP (the larger 8M Plus has one). That means one of two things. Either the sensor does its own processing and sends finished YUV or RGB frames (the OV5640 can do this, general knowledge), or the CPU does the clean-up. For gesture control, a sensor that sends finished frames is the easy case.
+
+**V4L2.** Video4Linux2 is the kernel's API for capture devices. Each capture device appears as a file such as `/dev/video0`. The `SUBDEV_API` option above adds extra nodes under `/dev/v4l-subdev*` for the inner parts. A program never talks to the sensor wires. It talks to the node.
+
+**The capture loop.** Frames arrive on the camera's schedule, so the kernel and the program share a small pool of buffers. The loop below is the standard V4L2 memory-mapped pattern from general knowledge. It is a sketch to show the shape. I did not compile or run it, and the repository has no equivalent.
+
+```cpp
+// Sketch only. Error checks and format negotiation left out.
+int fd = open("/dev/video0", O_RDWR);
+// 1. Ask for a size and pixel format (VIDIOC_S_FMT).
+// 2. Ask the kernel for N buffers (VIDIOC_REQBUFS), mmap each one.
+// 3. Queue every buffer to the kernel (VIDIOC_QBUF).
+// 4. Start the stream (VIDIOC_STREAMON).
+for (;;) {
+    poll(&pfd, 1, -1);               // sleep until a frame is ready
+    ioctl(fd, VIDIOC_DQBUF, &buf);   // take a filled buffer
+    process(mapped[buf.index]);      // read the pixels
+    ioctl(fd, VIDIOC_QBUF, &buf);    // hand it back for the next frame
+}
+```
+
+Walk through it. The kernel fills buffers in order. `DQBUF` ("dequeue") gives you one that is full. While you hold it, the kernel uses the others. If you take too long and every buffer is out, the kernel has nowhere to put the next frame and drops it. That is how a slow vision loop fails: it quietly sees fewer frames, not wrong ones. Handing the buffer back with `QBUF` fast matters more than being clever with the pixels. The `CMA` option in the kernel config (line 79, `CONFIG_CMA=y`) reserves a block of physically contiguous memory, which capture hardware commonly needs for these buffers (general knowledge).
+
+## The NPU question
+
+Vision models are mostly multiply-and-add. A phone or an AI board runs them on an NPU, a neural processing unit built for that arithmetic. **The i.MX 8M Mini does not have one.** That is general NXP datasheet knowledge, not from this repository, and the config backs it up only by absence: I searched the kernel config for NPU and accelerator drivers and found none.
+
+So any on-device vision on this chip would run on the same four Cortex-A53 CPU cores that run the UI and the audio engine, and the GPU (a Vivante part, with a G2D 2D engine already used for the screen in Module 2) is not a practical inference target here (general knowledge, unverified). Everything competes for the same cores. That is the real problem, and it connects straight back to Module 6.
+
+### The shared quota
+
+Module 2 showed the unit file that starts the app. Two lines in it matter for this question:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/ktkick.service" line={13} expect="CPUWeight=20">
+
+```text
+CPUWeight=20
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/ktkick.service" line={14} expect="CPUQuota=85%">
+
+```text
+CPUQuota=85%
+```
+
+</CodeRef>
+
+Per the systemd documentation (general knowledge, not verified on this box), a percentage quota is measured against **one** CPU. `CPUQuota=85%` means all the service's threads together get at most 0.85 of a core's time, no matter how many cores exist. On a four-core chip the machine has 400% to give and this service is capped at 85% of it. The kernel enforces that cap with CFS bandwidth control, which the config enables:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={12} expect="CONFIG_CFS_BANDWIDTH=y">
+
+```text
+CONFIG_CFS_BANDWIDTH=y
+```
+
+</CodeRef>
+
+Here is the danger. When a cgroup spends its quota early in a scheduling period, the kernel throttles every thread in it until the next period starts (general kernel behavior; the default period is 100 ms). That includes the audio thread. A camera loop living inside `ktkick.service` could burn the quota and push the audio thread into a pause long enough to click. Module 6 said the audio thread must finish every block in bounded time. Sharing a throttled budget with a vision loop breaks that promise without any bug in the audio code.
+
+Two other facts from the same file. The unit sets no CPU affinity, so threads float across all cores. And a search of the app code found no call that pins a thread to a core or raises a thread's priority outside a vendored SDL file (JUCE sets the audio thread's priority inside its own device code, general knowledge). The kernel does include cpusets, the cgroup feature that restricts a group to chosen cores:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={17} expect="CONFIG_CPUSETS=y">
+
+```text
+CONFIG_CPUSETS=y
+```
+
+</CodeRef>
+
+Nothing in the repository uses it for this. It is a tool you would reach for, though, and I use it in the design below.
+
+### A back-of-envelope budget
+
+This is an estimate with invented inputs. **I measured nothing on a KICK.** I did a small calculation in a scratch Python script to check the arithmetic, and the numbers below are what it printed. The real figures depend on the model, the library, the clock speed and the memory bandwidth, and I do not have any of those for this machine.
+
+My assumptions, all of them guesses:
+
+- A small hand-tracking model that runs on a low-resolution crop. I sized three candidates by how many multiply-accumulates (MACs) one frame costs: 10, 30 and 100 million.
+- A sustained 1 billion MACs per second on one Cortex-A53 core with 8-bit math and NEON vector instructions. This is a round number for the sake of the exercise, not a benchmark.
+- Capture at 320 by 240 pixels, 10 frames per second. That is one frame every 100 ms, so ten audio blocks of 10 ms (Module 6's 480-frame ceiling at 48 kHz) pass for every camera frame.
+
+| Model cost per frame | At 10 frames per second | At 15 frames per second |
+|---|---|---|
+| 10 million MACs | 10% of one core | 15% of one core |
+| 30 million MACs | 30% of one core | 45% of one core |
+| 100 million MACs | 100% of one core | 150% of one core |
+
+Pre-processing is small by comparison. A 320 by 240 frame is 76,800 pixels. At a guess of 20 simple operations per pixel and 15 frames per second, color conversion and resizing take about 2% of a core.
+
+Read the table against the quota. The whole service gets 85% of one core. The audio engine, the UI and the serial threads already use some of that. I do not know how much, and neither does anyone without a profile from a loaded unit. If the existing app uses even half the quota, the 30-million-MAC model at 10 frames per second takes most of what is left, and the 100-million-MAC model does not fit at all. The only comfortable region on this table is a very small model, at a low frame rate, in its own cgroup.
+
+Three conclusions follow, and all three are about design, not measurement:
+
+1. Give the vision work its **own service unit** with its own `CPUQuota=`, so its spending can never throttle the audio service's cgroup.
+2. Keep it **off the audio thread's core**. systemd has `CPUAffinity=` for this (general knowledge), and cpusets are in the kernel.
+3. Make it **yield**. Run it at a low weight so the scheduler favors audio when both want the CPU. Dropping a camera frame is harmless. Dropping an audio block is a click.
+
+## A design sketch: camera to sound
+
+**This is design, not implemented.** Nothing here exists in the repository. It is how I would build the missing half, using only ideas already proven elsewhere in the course. **Not verified on hardware.**
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>Capture thread</b><span class="layer layer-kernel">own process</span><br />Dequeues V4L2 buffers at 10 to 15 frames per second. Drops frames when late.</div>
+    <div class="kd-step"><b>Tiny model</b><span class="layer layer-userspace">own process</span><br />Finds the hand and a few landmark points. Pure math, no waiting.</div>
+    <div class="kd-step"><b>Smoothing filter</b><span class="layer layer-userspace">own process</span><br />Removes jitter. Turns raw points into one steady number.</div>
+    <div class="kd-step"><b>Map to a parameter</b><span class="layer layer-message">message thread</span><br />Hand height becomes, say, a filter cutoff in its real range.</div>
+    <div class="kd-step"><b>Hop to the engine</b><span class="layer layer-audio">audio thread</span><br />Lock-free hand-off. Audio reads it at the top of a block.</div>
+  </div>
+  <div class="kd-legend"><span><i></i>data</span><span><i class="control"></i>control</span><span><i class="clock"></i>clock</span></div>
+  <figcaption>The design in five boxes. The first three would live in a separate low-priority service. Only the last box touches the real-time rules.</figcaption>
+</figure>
+
+**Capture thread.** It loops exactly like the sketch above. Its only job is to keep buffers moving. If the model is still busy when a new frame arrives, it discards the older frame and keeps the newest. A vision loop that tries to process every frame falls behind and then reacts to where the hand was half a second ago.
+
+**Tiny model.** A hand-landmark model takes a cropped image and returns a few dozen (x, y) points. The budget table above says how small it has to be. Run it in a separate process so a crash or a stall there cannot touch the audio service. `Restart=on-failure` from Module 2 already shows the pattern for that.
+
+**Smoothing filter.** Raw landmarks jitter by a few pixels even when the hand is still. Mapped straight to a filter cutoff, that jitter becomes an audible shimmer. The simplest fix is a one-pole smoother: `y = y + a * (x - y)`, where `x` is the new reading, `y` is the stored value, and `a` between 0 and 1 sets how fast it follows. For a time constant of 0.1 seconds updated every 10 ms, `a` works out to about 0.095 (my scratch calculation). Add a dead zone around the current value so tiny movements do nothing. For gestures that fire an event, such as "closed fist", add hysteresis: require the pose to hold for a few frames before it counts, and require a clearly different pose to release it.
+
+**Map to a parameter.** Here the stream stops being pixels and becomes a control value between 0 and 1. A mapping curve, often exponential for pitch or frequency, turns that into a parameter range. This step belongs on the message thread, next to the code that already owns parameters (Module 9 shows how state is held). The camera process sends this value over a local socket, one small message per update.
+
+**Hop to the engine.** Module 6 laid out the rule: the message thread may never block the audio thread, and the road between them is a lock-free queue. The repository already has one, a single-producer single-consumer ring that writes the data first and only then moves the write marker:
+
+<CodeRef path="AudIO/AudIO/Core/SPSCQueue.h" line={17} expect="writePos.store(newWritePos);">
+
+```cpp
+writePos.store(newWritePos);
+```
+
+</CodeRef>
+
+The engine's patch queue is declared with room for 64 requests:
+
+<CodeRef path="AudIO/AudIO/Core/PatchQueue.h" line={106} expect="_queue;">
+
+```cpp
+SPSCQUeue<PatchData<T>, 64> _queue;
+```
+
+</CodeRef>
+
+I would not reuse that patch queue for gestures. Its one producer is already spoken for, and a second writer would break the single-producer rule. Instead I would add a second, separate queue for gesture events, and I would check the return value of `push` (the lesson from Module 6, Finding 4). For a plain continuous value like a cutoff, a queue is more than needed. A single `std::atomic<float>` holding the latest value is lock-free, and the audio thread reads it once at the top of each block. Latest value wins, which is exactly what a continuous control wants. The queue is for discrete events where losing one matters, such as "the hand closed".
+
+One last detail. The camera updates 10 times a second, but the audio engine runs a block every 10 ms, 100 times a second. If the audio thread jumps straight to each new value, the parameter moves in 10 Hz steps and you hear zipper noise. Run a second small smoother on the audio side, a few samples at a time, so the parameter glides between camera readings.
+
+Latency, for scale. At 10 frames per second the camera alone adds up to 100 ms of waiting, plus exposure and the model's run time (my estimate, unmeasured). That is fine for sweeping a filter. It is too slow for triggering a drum on a hand strike, which is why I would keep the pads and the MCU path from Module 5 for anything rhythmic.
+
+<Aside type="caution" title="Privacy: a camera on an instrument">
+A camera on a musical instrument sits in rooms where people do not expect to be watched: bedrooms, studios, stages. Three rules I would hold myself to. Process on the device and never send frames anywhere. Never store frames, only the control value that comes out of the filter. And tie a visible indicator, a small LED, to the capture service itself, so the light is on when frames are being read and cannot be on or off for any other reason. None of this is in the repository, because the camera path is not.
+</Aside>
+
+## Prototyping without hardware
+
+You can build and judge the whole front half on a laptop. This is a description of a plan. I have not run it, and I make no claim that it works with a particular KICK.
+
+1. Use the laptop webcam and any off-the-shelf hand-landmark model in Python. Run it at 10 to 15 frames per second on a small crop to match the budget above.
+2. Add the same one-pole smoother and dead zone from the design. Plot the raw and smoothed signals to tune `a` by eye.
+3. Send the result out as a MIDI continuous-controller message on a virtual MIDI port and watch it move a plugin in a DAW. This tests the feel of the mapping, with no embedded work at all.
+4. Later, replace the MIDI step with a message in the KICK's own wire format. Module 5 describes the frame layout and a stand-in that fills the app's message struct directly, which is the natural place to inject a gesture without any real camera. That is design only, not tested.
+5. Measure on the real board last: model time per frame, CPU use of the app under load, and the audio engine's worst block. Those three numbers replace my table.
+
+## Try it yourself
+
+With the upstream clone at the pinned commit, prove the absence yourself. Write one sentence for each answer.
+
+```bash
+# 1. Which camera-related kernel options are on?
+grep -n -E "MEDIA_CAMERA|V4L2_SUBDEV|MIPI_CSI|OV5640|USB_VIDEO_CLASS|IMX_CAPTURE|IMX_REMOTEPROC" \
+  Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig
+# 2. Does the board device tree patch mention a camera?
+grep -n -i -E "ov5640|csi|camera|mipi" \
+  Linux/buildroot/board/freescale/imx8mm_var_som/patches/linux/001.imx8mm_dtsi.patch
+# 3. Does the Buildroot recipe turn on any camera or vision package?
+grep -n -i -E "v4l|gstreamer|opencv|tflite|onnx|libcamera" Linux/buildroot/configs/KTKick_defconfig
+# 4. Does any app, audio or protocol code touch a camera?
+grep -rn -i -E "camera|v4l2|/dev/video|opencv|tflite|onnx|mediapipe" Kick ComProtocol
+grep -rn -i -E "camera|v4l2|/dev/video|opencv|tflite|onnx|mediapipe" AudIO | grep -v -E "minisdl|glfw|nuklear|Airwindopedia|imgui"
+# 5. Where does the word appear at all?
+grep -rn "AI camera" README.md
+```
+
+Expected: command 1 prints the lines cited above. Commands 2 and 3 print nothing. The two searches in command 4 print nothing from app code (the `AudIO` line removes a vendored SDL header, two vendored GLFW and GUI libraries, and a text file of plugin notes that mention camcorders). Command 5 prints one line, the README feature list. Then answer: if you owned this product, which of the table's "does not exist" rows would you build first, and what would you measure before choosing the model?
+
+Search tip: `-i` makes the match case-insensitive. Without it you will miss `Camera`.
+
+## Check yourself
+
+<Quiz
+  items={[
+    {
+      q: 'What does the repository prove about the KICK camera?',
+      options: [
+        'A working gesture-control feature with a trained model',
+        'Kernel drivers for a MIPI CSI-2 camera and an OV5640 sensor are enabled, and nothing in the app uses them',
+        'Only the README line, with no kernel support at all',
+        'A camera daemon that is disabled at build time',
+      ],
+      answer: 1,
+      why: 'The kernel config enables the CSI receiver and sensor drivers. Searches of the app, audio and protocol code, and of the Buildroot recipe, find no capture code, no model and no runtime.',
+    },
+    {
+      q: 'In the V4L2 capture loop, what happens if your processing is slower than the frame rate and every buffer is checked out?',
+      options: [
+        'The kernel blocks the whole system',
+        'The sensor slows itself down automatically',
+        'The kernel has no free buffer for the next frame and drops it',
+        'The oldest buffer is silently overwritten while you read it',
+      ],
+      answer: 2,
+      why: 'Buffers are a small shared pool. With none queued, the new frame has nowhere to go and is dropped. Returning buffers quickly keeps frames flowing.',
+    },
+    {
+      q: 'Why does the missing NPU matter for a camera on this board?',
+      options: [
+        'The camera driver refuses to load without an NPU',
+        'Vision would run on the same CPU cores as the audio engine and UI',
+        'The audio codec needs the NPU for sample-rate conversion',
+        'MIPI CSI-2 only works on chips that have an NPU',
+      ],
+      answer: 1,
+      why: 'Without an accelerator, inference uses ordinary CPU cores, so it competes with the audio thread for time. That is the budget problem the lesson works through.',
+    },
+    {
+      q: 'ktkick.service sets CPUQuota=85%. Why is putting a vision loop inside that service risky?',
+      options: [
+        'Quota stops the service from opening /dev/video0',
+        'The whole service shares 85% of one core, and exceeding it throttles every thread in it, including audio',
+        'A quota makes the audio thread run at half speed all the time',
+        'systemd kills any service that uses a camera',
+      ],
+      answer: 1,
+      why: 'The quota is a shared cap on the cgroup. When it runs out, all threads in the group wait for the next period. A heavy vision loop can push the audio thread into that pause.',
+    },
+    {
+      q: 'In the design sketch, how should a smoothed, continuous hand-height value reach the audio engine?',
+      options: [
+        'By taking a mutex the audio thread also takes',
+        'By calling malloc on the audio thread to store each reading',
+        'Through a lock-free hand-off, such as a std::atomic<float> for the latest value or a separate single-producer queue for discrete events',
+        'By writing it to a file the audio thread polls each block',
+      ],
+      answer: 2,
+      why: 'Module 6 bans blocking locks, allocation and file reads on the audio thread. An atomic or a lock-free single-producer queue never makes the audio thread wait.',
+    },
+  ]}
+/>
+
+## Words to know
+
+| Term | Meaning |
+|---|---|
+| V4L2 | Video4Linux2. The kernel API that exposes cameras as files such as `/dev/video0` |
+| MIPI CSI-2 | A camera-specific serial link: a few fast lanes from sensor to chip |
+| Sensor | The chip that turns light into pixel data. Here, the OV5640 |
+| ISP | Image signal processor. Hardware that cleans up raw sensor output without using the CPU |
+| UVC | USB Video Class. The standard driver for USB webcams. The gadget side makes a device act like one |
+| Subdevice | An inner part of a camera pipeline (sensor, receiver) exposed as its own device node |
+| Buffer queue | The small pool of memory blocks the kernel fills with frames and the program hands back |
+| NPU | Neural processing unit. Hardware built for the multiply-and-add math in neural networks |
+| MAC | Multiply-accumulate. One multiply plus one add, the unit used to size a model's cost |
+| remoteproc | The Linux framework for loading firmware onto, and talking to, another core on the chip |
+| CPU quota | A cap on how much CPU time a systemd service may use, shared by all its threads |
+| Throttling | The kernel pausing every thread in a group once its quota for the period is spent |
+| One-pole smoother | A filter that moves a value a fixed fraction of the way toward each new reading |
+| Hysteresis | Using different thresholds to start and stop a state so it does not flicker |
+
+Next: Module 12 (coming soon).

@@ -1,0 +1,881 @@
+---
+title: '4. The app skeleton'
+description: How the KICK app is put together. One JUCE program, a message thread that must never block, a tour of the modules, and how a screen opens from tap to pixels.
+---
+
+import { Image } from 'astro:assets';
+import { Aside } from '@astrojs/starlight/components';
+import CodeRef from '../../../components/CodeRef.astro';
+import Quiz from '../../../components/Quiz.astro';
+import hero from '../../../assets/heroes/m04-app-skeleton.png';
+
+<Image src={hero} alt="Blank panels hang from a central spine of glowing blue lines, with one panel pulled forward." />
+
+**Module 4 of 12 &#183; about 35 minutes &#183; needs Module 2**
+
+The KICK app is about 255 lines of startup code sitting on top of a pile of modules. If you open the repository cold, the pile is what you see first. This lesson gives you the map. You will know where the program starts, which thread does what, how a screen gets built, and where a new screen would plug in.
+
+By the end you will be able to trace one tap on the home screen from the first signal to the screen becoming visible, naming each file and each thread on the way.
+
+<Aside type="note" title="Analogy">
+A restaurant. The front of house has one host who talks to every guest and must never walk away from the door. The kitchen has cooks who can take as long as the dish needs. The host hands orders to the kitchen and asks to be told when the plate is ready. The host is the message thread. The cooks are worker threads. The rule that keeps the restaurant alive is simple: the host never cooks.
+</Aside>
+
+## What JUCE is, and the two threads that matter
+
+JUCE is a C++ framework for audio software and its user interfaces. It gives you windows, buttons, drawing, timers, audio device access and a shared event system. Most commercial plugins are built on it. The KICK app is one JUCE program (general knowledge about JUCE, plus the code below that uses it).
+
+Two threads matter for this lesson.
+
+- **The message thread.** One thread runs the event loop. Every tap, every repaint, every timer callback and every screen change runs here, one at a time. If code on this thread takes 200 ms, the screen freezes for 200 ms. So the rule is: never block the message thread. No long file reads, no waiting on a lock another thread holds, no sleeping.
+- **The audio thread.** The audio driver calls your code on its own high-priority thread, over and over, with a small buffer to fill. If you miss the deadline you get a click or a dropout. Rules for this thread are stricter still: no memory allocation, no locks, no file access (general real-time audio knowledge). Module 6 covers it in depth.
+
+The code shows both. The sample player registers a callback with the audio device manager:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_sample_player.cpp" line={32} expect="devmgr.addAudioCallback(">
+
+```cpp
+devmgr.addAudioCallback( &player );
+```
+
+</CodeRef>
+
+And its `getNextAudioBlock` is the function the audio thread calls to get the next buffer (JUCE's `AudioSource` contract, general knowledge):
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_sample_player.cpp" line={150} expect="MTSamplePlayer::getNextAudioBlock(">
+
+```cpp
+void MTSamplePlayer::getNextAudioBlock( const juce::AudioSourceChannelInfo& bufferToFill )
+```
+
+</CodeRef>
+
+Everything else in this lesson runs on the message thread, plus a thread pool for jobs that must not block it.
+
+## The module tour
+
+The app logic lives in `Kick/modules`. Each folder is a JUCE module, a unit of source that CMake registers by name. The registration list is short enough to read in one glance:
+
+<CodeRef path="Kick/modules/CMakeLists.txt" line={7} expect="kick_ui">
+
+```text
+kick_ui
+```
+
+</CodeRef>
+
+The engine modules are added from their own folder, so they do not appear in that list:
+
+<CodeRef path="Kick/modules/CMakeLists.txt" line={23} expect="add_subdirectory(engine)">
+
+```text
+add_subdirectory(engine)
+```
+
+</CodeRef>
+
+I listed the folder at the pinned commit. Here is what each one is for. The one-line purposes come from the upstream architecture notes and from reading the files I cite in this lesson, not from the folder names alone.
+
+| Folder under `Kick/modules` | What it holds |
+|---|---|
+| `engine/` | The audio engine: sequences, tracks, notes, programs, sampler, project and settings. Several modules under one folder |
+| `kick_ui/` | The screens: dialogs, modes, the sequencer, sample editor, sampler, looper, XY effects |
+| `kick_ui_common/` | The `Screen` list and the `IScreen` base class |
+| `kick_ui_controls/`, `kick_ui_components/` | Buttons, sliders, look and feel, composite widgets, helpers such as the thread pool |
+| `kick_ui_header/`, `_selectors/`, `_settings/`, `_channel_mixer/`, `_systemResources/`, `program_edit_ui/` | Feature-specific UI pieces |
+| `kick_leds/` | Pad LED and colour control |
+| `input_events/` | Serial transport to the control-surface MCU (Module 5) |
+| `hardware/` | I2C, system preferences, firmware update, USB, Wi-Fi helpers |
+| `contracts/` | Shared interfaces and constants between parts of the program |
+| `ipc/` | A messaging layer for the multi-process build |
+| `common/` | Paths, constants, small utilities |
+| `audio_interface/`, `_playback/` | Thin glue and a playback helper |
+| `3rdParty/` | Vendored libraries such as a signal/slot library |
+
+A good habit: when you want to change behavior, ask first whether it is a screen (`kick_ui`), a rule of the audio (`engine`), or a talk-to-hardware matter (`input_events`, `hardware`, `kick_leds`). That one question narrows the search to a few folders.
+
+## Startup: from `main` to the first window
+
+A JUCE app does not write `main()`. A macro writes it. The last line of `Main.cpp` is that macro:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={255} expect="START_JUCE_APPLICATION( AudioEngineApplication )">
+
+```cpp
+START_JUCE_APPLICATION( AudioEngineApplication )
+```
+
+</CodeRef>
+
+The macro generates `main()`, which creates the class you name, runs the message loop, and calls its hooks. The class derives from `juce::JUCEApplication`:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={109} expect="class AudioEngineApplication : public juce::JUCEApplication">
+
+```cpp
+class AudioEngineApplication : public juce::JUCEApplication
+```
+
+</CodeRef>
+
+It refuses a second copy of itself:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={123} expect="bool moreThanOneInstanceAllowed() override">
+
+```cpp
+bool moreThanOneInstanceAllowed() override
+```
+
+</CodeRef>
+
+The hook that matters is `initialise`. JUCE calls it on the message thread once the loop is ready:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={129} expect="void initialise(">
+
+```cpp
+void initialise( const juce::String& /*commandLine*/ ) override
+```
+
+</CodeRef>
+
+Inside it, the order is the lesson. Read it top to bottom.
+
+**Step 1: the adapters.** First the audio interface object and its engine adapter, then the device adapter:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={131} expect="audioInterface.reset(new KickAudioInterface());">
+
+```cpp
+audioInterface.reset(new KickAudioInterface());
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={134} expect="adapter.reset( new KickDeviceAdapter() )">
+
+```cpp
+adapter.reset( new KickDeviceAdapter() );
+```
+
+</CodeRef>
+
+**Step 2: leave kiosk mode, for now.** The code asks JUCE to stop treating any component as the full-screen kiosk component:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={139} expect="setKioskModeComponent( nullptr )">
+
+```cpp
+juce::Desktop::getInstance().setKioskModeComponent( nullptr );
+```
+
+</CodeRef>
+
+The comment above it says "Exit kiosk mode". I want to be careful here, because a quick read could get this backwards. Passing `nullptr` clears kiosk mode. It does not turn it on.
+
+There is a second call near the end of `initialise`, though. On Linux, iOS and Android builds, after the window exists, the code hands the window to JUCE as the kiosk component:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={170} expect="setKioskModeComponent( w.get(), false )">
+
+```cpp
+juce::Desktop::getInstance().setKioskModeComponent( w.get(), false );
+```
+
+</CodeRef>
+
+So the sequence is: clear, build the window, then set it. What the `false` does is JUCE's own parameter (general knowledge: it is the `allowMenusAndBars` flag). I have not run this on a device, so I cannot tell you how it looks on the real screen. Treat the full-screen behavior as unverified.
+
+**Step 3: touch the singletons.** Two lines that look like they do nothing:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={142} expect="mt::getSettings();">
+
+```cpp
+mt::getSettings();
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={145} expect="mt::getAudioInterface();">
+
+```cpp
+mt::getAudioInterface();
+```
+
+</CodeRef>
+
+They call a function and throw the result away. The point is the side effect: the first call builds the object. The next section explains why that works.
+
+**Step 4: build the window.**
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={148} expect="( getApplicationName() );">
+
+```cpp
+w = std::make_unique<HomeWindow>( getApplicationName() );
+```
+
+</CodeRef>
+
+`HomeWindow` is a small class inside `Main.cpp`. Its constructor hands one object to the window as its content, the home component:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={224} expect="kick_ui::KickHome::Instance(), true )">
+
+```cpp
+setContentOwned( &kick_ui::KickHome::Instance(), true );
+```
+
+</CodeRef>
+
+That is the hand-off from "app startup" to "the UI". From here, `KickHome` runs the show.
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>START_JUCE_APPLICATION</b><span class="layer layer-userspace">user space</span><br />Macro writes main() and starts the message loop.</div>
+    <div class="kd-step"><b>initialise</b><span class="layer layer-message">message thread</span><br />Adapters, kiosk call, singletons.</div>
+    <div class="kd-step"><b>HomeWindow</b><span class="layer layer-message">message thread</span><br />Owns KickHome as its content.</div>
+    <div class="kd-step"><b>KickHome</b><span class="layer layer-message">message thread</span><br />Builds the first screen, queues the rest.</div>
+  </div>
+  <figcaption>Startup in four boxes. Every box runs on the message thread.</figcaption>
+</figure>
+
+## Singletons: easy to reach, hard to see
+
+A singleton is an object of which exactly one exists, reachable from anywhere. The KICK uses two patterns for them.
+
+The first is the **accessor function** that builds the object on first call. Settings:
+
+<CodeRef path="Kick/modules/engine/project/kick_settings.cpp" line={26} expect="static KickSettings settingsInstance;">
+
+```cpp
+static KickSettings settingsInstance;
+```
+
+</CodeRef>
+
+And the audio interface, same shape:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_interface.cpp" line={128} expect="static MTAudioInterface _audioInterface(">
+
+```cpp
+static MTAudioInterface _audioInterface( ProjectInfo::projectName, ProjectInfo::companyName, ProjectInfo::versionString );
+```
+
+</CodeRef>
+
+A `static` local variable inside a function is built the first time execution reaches it, once, and C++11 guarantees that is thread-safe (general C++ knowledge). That is why `mt::getSettings();` alone in `initialise` does something: it forces the build at a time the author chose, instead of at some random first use. The declaration the rest of the code sees is one line:
+
+<CodeRef path="Kick/modules/engine/project/kick_settings.h" line={251} expect="getSettings();">
+
+```cpp
+KickSettings& getSettings();
+```
+
+</CodeRef>
+
+The second pattern is a **class with a static `Instance()`**. The home component works this way, and its constructor is private so nobody else can make one:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.h" line={34} expect="Instance()">
+
+```cpp
+static KickHome& Instance()
+```
+
+</CodeRef>
+
+### The trade-off
+
+The upside is real. Any file can write `mt::getAudioInterface()` and get the engine. No plumbing. Look at how many places do exactly that. The LED module grabs both singletons as member initializers:
+
+<CodeRef path="Kick/modules/kick_leds/kick_leds.h" line={69} expect="ae{ mt::getAudioInterface() }">
+
+```cpp
+mt::MTAudioInterface&               ae{ mt::getAudioInterface() };
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_leds/kick_leds.h" line={70} expect="settings{ mt::getSettings() }">
+
+```cpp
+mt::KickSettings&                   settings{ mt::getSettings() };
+```
+
+</CodeRef>
+
+The cost is that the dependency is invisible. `KickLEDs` needs the engine and the settings to work, but you cannot see that from its constructor signature. To know what a class touches, you have to read its body. Two more problems follow:
+
+- **Testing is harder.** You cannot swap the real audio interface for a fake one in a test, because the class goes and gets the real one itself.
+- **Order matters, and nothing enforces it.** If one singleton's constructor calls another, the chain works until someone changes it.
+
+None of this is wrong for a device that ships as one program. It is a speed-of-development choice. If you plan to write unit tests for your own screens, the cheapest fix is to hand your class the objects it needs through its constructor, and have the caller pass `mt::getAudioInterface()`.
+
+## KickHome and the `IScreen` idea
+
+Every distinct page of the UI is a **screen**. There is one list of all of them, an enum:
+
+<CodeRef path="Kick/modules/kick_ui_common/source/kick_IScreen.h" line={27} expect="enum class Screen">
+
+```cpp
+enum class Screen
+```
+
+</CodeRef>
+
+And one base class that every screen implements:
+
+<CodeRef path="Kick/modules/kick_ui_common/source/kick_IScreen.h" line={79} expect="class IScreen">
+
+```cpp
+class IScreen
+```
+
+</CodeRef>
+
+A screen tells the base class its own type when it is built:
+
+<CodeRef path="Kick/modules/kick_ui_common/source/kick_IScreen.h" line={85} expect="explicit IScreen( Screen Scr )">
+
+```cpp
+explicit IScreen( Screen Scr )
+```
+
+</CodeRef>
+
+And it answers a few yes/no questions that tell the home component how to lay it out. Does it want the top control bar?
+
+<CodeRef path="Kick/modules/kick_ui_common/source/kick_IScreen.h" line={98} expect="virtual bool requiresControlBar() { return false; };">
+
+```cpp
+virtual bool requiresControlBar() { return false; };
+```
+
+</CodeRef>
+
+Concrete screens inherit it. The grid view, for example, is declared as a component and an `IScreen` at once:
+
+<CodeRef path="Kick/modules/kick_ui/audio_components/gridview/kick_AppGrid.h" line={280} expect=", public kick_ui::IScreen">
+
+```cpp
+, public kick_ui::IScreen
+```
+
+</CodeRef>
+
+`KickHome` owns all the screens in one map from `Screen` to the screen object:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.h" line={60} expect="screens_;">
+
+```cpp
+std::map<Screen, std::unique_ptr<IScreen>> screens_;
+```
+
+</CodeRef>
+
+### Signals
+
+Screens do not call each other. They send a signal, and `KickHome` listens. The signals are static members, from the sigslot library in `3rdParty`:
+
+<CodeRef path="Kick/modules/kick_ui_common/source/kick_IScreen.h" line={71} expect="sigScreenOpen;">
+
+```cpp
+static sigslot::signal<Screen> sigScreenOpen;
+```
+
+</CodeRef>
+
+A signal is a list of functions. Calling the signal calls every function connected to it. It is the observer pattern with a short name. `KickHome` connects to `sigScreenOpen` in its constructor:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={144} expect="signals::sigScreenOpen.connect(">
+
+```cpp
+signals::sigScreenOpen.connect( [&]( Screen Scrn ) {
+```
+
+</CodeRef>
+
+The benefit: a screen that wants to open another only needs the enum value, not a pointer to the other screen. The cost matches the singleton problem. To find who opens a screen, you search for the enum name across the repo, because there is no direct call to follow.
+
+### Building screens
+
+This is where the "lazy" part lives, and my earlier summary in Module 2 needs a correction. Module 2 said screens are built when you tap them. The code builds them in the background right after startup, all in one batch. Here is what it actually does.
+
+`KickHome` defines a small helper, `screenAdder`. It takes a screen, hides it, makes it a child of the home component and stores it in the map:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={178} expect="auto screenAdder = [">
+
+```cpp
+auto screenAdder = [&]( Screen Type, std::unique_ptr<IScreen> Screen ) {
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={183} expect="screens_[Type] = std::move( Screen );">
+
+```cpp
+screens_[Type] = std::move( Screen );
+```
+
+</CodeRef>
+
+The first screen, the recent-projects list, is built right there in the constructor, so something can show immediately:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={191} expect="screenAdder( Screen::RecentProject">
+
+```cpp
+screenAdder( Screen::RecentProject, std::make_unique<ui::RecentProject>() );
+```
+
+</CodeRef>
+
+Then it asks to open that screen:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={207} expect="sigScreenOpen( Screen::RecentProject )">
+
+```cpp
+signals::sigScreenOpen( Screen::RecentProject );
+```
+
+</CodeRef>
+
+Everything else comes after, in a batch. A comment in the source describes the intent:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={209} expect="Lazily create and load rest of the screens">
+
+```cpp
+// Now, Lazily create and load rest of the screens
+```
+
+</CodeRef>
+
+The first lines of that batch, then, are the grid, the sequencer and the list view:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={213} expect="screenAdder( Screen::HomeListView,">
+
+```cpp
+screenAdder( Screen::HomeListView, std::make_unique<AppMainmode>() );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={214} expect="screenAdder( Screen::HomeGridView,">
+
+```cpp
+screenAdder( Screen::HomeGridView, std::make_unique<AppGrid>() );
+```
+
+</CodeRef>
+
+The list runs to the last entry:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={240} expect="screenAdder( Screen::Inserts,">
+
+```cpp
+screenAdder( Screen::Inserts, std::make_unique<Inserts>() );
+```
+
+</CodeRef>
+
+That is 27 screens built one after another, after the first one is up. "Lazy" here means deferred past the first frame, not built on first use. A screen you never open still exists once that batch has run.
+
+### Showing a screen
+
+When the signal fires, `KickHome` does not switch screens inside the signal handler. It pushes the work to the message thread's queue:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={150} expect="juce::MessageManager::callAsync( [Scrn, this]() {">
+
+```cpp
+juce::MessageManager::callAsync( [Scrn, this]() {
+```
+
+</CodeRef>
+
+The `load` function runs later. It falls back to the list view if you ask for a screen that is not in the map:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={266} expect="currentScreen = ( screens_.end() != screens_.find( screen ) ) ? screen : Screen::HomeListView;">
+
+```cpp
+currentScreen = ( screens_.end() != screens_.find( screen ) ) ? screen : Screen::HomeListView;
+```
+
+</CodeRef>
+
+Then it requests an async update:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={268} expect="triggerAsyncUpdate();">
+
+```cpp
+triggerAsyncUpdate();
+```
+
+</CodeRef>
+
+`triggerAsyncUpdate` is a JUCE method that schedules `handleAsyncUpdate` on the message thread (general JUCE knowledge). That function hides every screen and shows the current one, sets control and status bar visibility from the screen's yes/no answers, and fixes its size:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={283} expect="ctrlBar_">
+
+```cpp
+ctrlBar_->setVisible( p->requiresControlBar() );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={293} expect="pScr">
+
+```cpp
+pScr->setVisible( true );
+```
+
+</CodeRef>
+
+All screens are children of the home component at all times. Only one is visible. "Opening" a screen is a visibility flip.
+
+<Aside type="caution" title="My reading, not run on hardware">
+Between startup and the end of that batch, the map holds only the recent-projects screen. A signal asking for any other screen would hit the fallback to `HomeListView`, which is also not in the map yet. Also, `getScreen` uses `screens_[screen]`, and the square-bracket form of a C++ map inserts an empty entry when the key is missing:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={255} expect="return screens_[screen].get();">
+
+```cpp
+return screens_[screen].get();
+```
+
+</CodeRef>
+
+That returns a null pointer for a missing screen. I read this as a startup window of a fraction of a second where a fast input could be dropped. I have not measured how long the batch takes on the device.
+</Aside>
+
+## Thread hops
+
+The batch above does something worth looking at closely. It runs on a thread pool, then immediately hops back to the message thread:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={210} expect="mt::threadPool.addJob(">
+
+```cpp
+mt::threadPool.addJob( [&, screenAdder]() {
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={211} expect="juce::MessageManager::callAsync(">
+
+```cpp
+juce::MessageManager::callAsync( [&, screenAdder]() {
+```
+
+</CodeRef>
+
+The pool is a global with five worker threads:
+
+<CodeRef path="Kick/modules/kick_ui_controls/source/kick_utils.h" line={29} expect="static juce::ThreadPool threadPool{ 5 };">
+
+```cpp
+static juce::ThreadPool threadPool{ 5 };
+```
+
+</CodeRef>
+
+The pattern, in general, is:
+
+1. The message thread hands a job to a worker (`addJob`).
+2. The worker does the slow part, such as reading a file or decoding data.
+3. The worker cannot touch the UI. JUCE components belong to the message thread. So it hands a small piece of work back (`callAsync`), which runs on the message thread when its turn comes.
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>addJob</b><span class="layer layer-message">message thread</span><br />Queue a job. Return at once.</div>
+    <div class="kd-step"><b>Slow work</b><span class="layer layer-userspace">pool worker</span><br />File reads, decoding, anything that waits.</div>
+    <div class="kd-step"><b>callAsync</b><span class="layer layer-userspace">pool worker</span><br />Post a small closure back. Do not touch UI here.</div>
+    <div class="kd-step"><b>Closure runs</b><span class="layer layer-message">message thread</span><br />Safe to create and show components.</div>
+  </div>
+  <figcaption>The hop. Slow work leaves the message thread and the result comes back as a queued closure.</figcaption>
+</figure>
+
+Now compare that with what the screen batch really does. Look at lines 210 and 211 together. The pool job contains nothing slow. Its only statement is the `callAsync`, and all 27 screen constructors sit inside that closure. So they run on the message thread, not on the worker. The pool hop only changes when they run: after the current work finishes, not before. It defers the batch. It does not move any work off the message thread. If a screen constructor is slow, it will still freeze the display for that long. That is an observation about the code. I did not time it.
+
+One more detail of the pool. It is declared `static` at namespace scope in a header. In C++, that gives each source file that includes the header its own private copy (general C++ knowledge: `static` gives internal linkage). That means "the" pool may be several pools of five threads each, depending on how many files include it. I have not counted them.
+
+## Monolith or several programs?
+
+Open `Kick/apps` and you see many folders. They are not all part of one image. They fall into three groups.
+
+**The monolith.** `apps/kick` is the program this lesson just walked through. It builds the engine, the UI and the hardware control all inside one process. `Main.cpp` calls `mt::getAudioInterface()` directly, with no messaging layer between the UI and the engine. The boot script from Module 2 starts a binary called `KT_Kick`. I did not confirm that the CMake target named `Kick` produces that file name. The helper script copies a file with that name after the build:
+
+<CodeRef path="Kick/buildApp.sh" line={8} expect="cp KT_Kick ../../">
+
+```sh
+cp KT_Kick ../../
+```
+
+</CodeRef>
+
+**The split build.** The same folder also holds five other apps that together do the monolith's job as separate processes. The default build list includes all of them:
+
+<CodeRef path="Kick/apps/CMakeLists.txt" line={2} expect="add_subdirectory(kick)">
+
+```text
+add_subdirectory(kick)
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/apps/CMakeLists.txt" line={7} expect="add_subdirectory(kick_main)">
+
+```text
+add_subdirectory(kick_main)
+```
+
+</CodeRef>
+
+The pieces: a supervisor named "Kick Main", an engine, an audio model, a device-control process and a UI process. Their names and network ports are fixed in one header. Four of them:
+
+<CodeRef path="Kick/modules/contracts/config/ipc_config_constants.h" line={35} expect="ENGINE_EXE_NAME">
+
+```cpp
+static const juce::String ENGINE_EXE_NAME( "KickAudioEngine" + BINARY_EXTENSION );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/contracts/config/ipc_config_constants.h" line={42} expect="MODEL_EXE_NAME">
+
+```cpp
+static const juce::String MODEL_EXE_NAME( "KickAudioModel" + BINARY_EXTENSION );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/contracts/config/ipc_config_constants.h" line={48} expect="DCL_EXE_NAME">
+
+```cpp
+static const juce::String DCL_EXE_NAME( "KickDeviceControl" + BINARY_EXTENSION );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/contracts/config/ipc_config_constants.h" line={54} expect="GUI_EXE_NAME">
+
+```cpp
+static const juce::String GUI_EXE_NAME( "KickUserInterface" + BINARY_EXTENSION );
+```
+
+</CodeRef>
+
+The supervisor class is `KickMain`, and the UI process builds the same `HomeWindow` around the same `KickHome`:
+
+<CodeRef path="Kick/apps/kick_main/kick_main.cpp" line={43} expect="KickMain()">
+
+```cpp
+KickMain()
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/apps/kick_gui/kick_gui_main.cpp" line={233} expect="kick_ui::KickHome::Instance(), true );">
+
+```cpp
+setContentOwned( &kick_ui::KickHome::Instance(), true );
+```
+
+</CodeRef>
+
+So the UI code is shared. The difference is how it reaches the engine. The code does not tell me which of the two builds the shipped image runs. The image configuration and the boot script from Module 2 point at the single `KT_Kick` binary, so my working assumption is the monolith. That is an assumption, and Module 3 is where you can confirm it from the Buildroot package list.
+
+**Dev tools and extras.** These build only when an option is on:
+
+<CodeRef path="Kick/apps/CMakeLists.txt" line={22} expect="add_subdirectory(kickem)">
+
+```text
+add_subdirectory(kickem)
+```
+
+</CodeRef>
+
+`kickem` is the desktop simulator, built when `KICK_SIMULATOR` is set. `kickvst` is a plugin build, behind `KICK_VST_PLUGIN`:
+
+<CodeRef path="Kick/apps/CMakeLists.txt" line={27} expect="add_subdirectory(kickvst)">
+
+```text
+add_subdirectory(kickvst)
+```
+
+</CodeRef>
+
+And `midiPort` is a different animal altogether. It is plain C, not JUCE, built only if `MIDIPORT` is set:
+
+<CodeRef path="Kick/apps/CMakeLists.txt" line={31} expect="add_subdirectory(midiPort)">
+
+```text
+add_subdirectory(midiPort)
+```
+
+</CodeRef>
+
+It builds one executable from a single C file:
+
+<CodeRef path="Kick/apps/midiPort/CMakeLists.txt" line={8} expect="add_executable(KICKMIDI src/ttymidi.c)">
+
+```text
+add_executable(KICKMIDI src/ttymidi.c)
+```
+
+</CodeRef>
+
+The file is the open-source `ttymidi` tool, which bridges a serial port to ALSA MIDI:
+
+<CodeRef path="Kick/apps/midiPort/src/ttymidi.c" line={145} expect="ttymidi - Connect serial port devices to ALSA MIDI programs!">
+
+```c
+static char doc[]       = "ttymidi - Connect serial port devices to ALSA MIDI programs!";
+```
+
+</CodeRef>
+
+It is a helper that makes serial MIDI visible to Linux. It does not link against the KICK modules.
+
+### Monolith versus several processes
+
+| | One process | Several processes |
+|---|---|---|
+| A crash in the engine | Takes down the whole app | The supervisor can notice and restart one piece |
+| Speed of a call between UI and engine | A function call | A message over a socket |
+| Debugging | One debugger, one log | Several logs, startup order, ports |
+| Memory | One address space | Isolation, at a cost per process |
+
+The supervisor does appear built for the multi-process case: it starts a heartbeat monitor on boot.
+
+<CodeRef path="Kick/apps/kick_main/kick_main.cpp" line={60} expect="startMonitoring();">
+
+```cpp
+monitor->startMonitoring();
+```
+
+</CodeRef>
+
+## Where a new screen goes
+
+I can only list what the code shows. Adding a screen touches four places.
+
+1. **The enum.** Add a name to `Screen` in `kick_IScreen.h`. The existing list ends with `Inserts` and `Temp`:
+
+<CodeRef path="Kick/modules/kick_ui_common/source/kick_IScreen.h" line={64} expect="Inserts,">
+
+```cpp
+Inserts,
+```
+
+</CodeRef>
+
+2. **The class.** Write a component that also inherits `kick_ui::IScreen` and passes its enum value to the base constructor, the way the grid view does:
+
+<CodeRef path="Kick/modules/kick_ui/audio_components/gridview/kick_AppGrid.cpp" line={141} expect=": kick_ui::IScreen( Screen::HomeGridView )">
+
+```cpp
+: kick_ui::IScreen( Screen::HomeGridView )
+```
+
+</CodeRef>
+
+3. **Registration.** Add one `screenAdder` line to the batch in `KickHome`, next to line 240.
+4. **A way to reach it.** Something has to send `sigScreenOpen( Screen::YourNewScreen )`. That could be a menu entry or a button handler.
+
+Overriding `requiresControlBar` and `requiresStatusBar` decides which bars show. The source files in `kick_ui` are picked up by CMake as part of the module (I did not verify how the globbing works, so check that a new file lands in the build before you trust it).
+
+## Customization pointers
+
+- **Add a screen:** the four steps above. Start by copying a small existing screen.
+- **Change startup order or the first screen:** `KickHome`'s constructor, around lines 191 and 207.
+- **Change what happens at boot:** `initialise` in `Main.cpp`.
+- **Turn the pool-based batch into something real:** move the slow part of a screen's setup into the `addJob` body and keep only the `setVisible` and `addChildComponent` calls inside the `callAsync`.
+- **Reduce hidden dependencies:** take the engine and settings in constructors instead of calling the global accessors.
+
+## Try it yourself
+
+With the upstream clone checked out at the pinned commit, do a grep tour. Run each command and write one sentence about what you found.
+
+```bash
+cd Kick
+# 1. Where does the program start?
+grep -n "START_JUCE_APPLICATION" apps/*/*.cpp
+# 2. How many places reach the engine through the global?
+grep -rn "getAudioInterface()" modules | wc -l
+# 3. Which classes are screens?
+grep -rn "IScreen" modules/kick_ui --include=*.h
+# 4. Who asks for a given screen to open?
+grep -rn "Screen::MenuSampler" modules
+```
+
+Now trace one screen open end to end. Pick `Screen::MenuSampler`. Find (a) the line that registers it in the batch, (b) the files that send `sigScreenOpen` with it, (c) the `connect` handler that receives the signal, (d) the `callAsync` that queues the work, and (e) the `setVisible( true )` that makes it show. Write the file and line for each. Then answer: which thread runs each step?
+
+## Check yourself
+
+<Quiz
+  items={[
+    {
+      q: 'What is the one rule for the message thread?',
+      options: [
+        'Never create components on it',
+        'Never block it with slow or waiting work',
+        'Only run audio code on it',
+        'Run exactly one job per second',
+      ],
+      answer: 1,
+      why: 'Every tap, repaint and screen change runs on this one thread. If it blocks, the screen freezes.',
+    },
+    {
+      q: 'Why does initialise call mt::getSettings(); and ignore the result?',
+      options: [
+        'To print the settings to a log',
+        'To force the singleton to be built at a chosen time',
+        'To save the settings to disk',
+        'To check that the audio device is plugged in',
+      ],
+      answer: 1,
+      why: 'A function-local static is built the first time the function runs. Calling it early decides when the build happens.',
+    },
+    {
+      q: 'What is the main cost of the singleton accessors such as mt::getAudioInterface()?',
+      options: [
+        'They are slower than a normal function',
+        'They cannot be called from the UI',
+        'A class depends on the engine without saying so in its constructor, which also makes tests harder',
+        'They create a new engine every call',
+      ],
+      answer: 2,
+      why: 'The dependency is real but hidden inside the function body. Tests cannot swap in a fake easily, and readers must scan the code to see what a class touches.',
+    },
+    {
+      q: 'KickHome builds most screens inside a pool job that immediately calls callAsync. What does that actually achieve?',
+      options: [
+        'It runs the screen constructors on a worker thread',
+        'It builds each screen only when the user taps it',
+        'It defers the batch until after the first screen is up, but the constructors still run on the message thread',
+        'It lets screens be built in parallel',
+      ],
+      answer: 2,
+      why: 'The only statement in the pool job is the callAsync, so the constructors inside it run on the message thread, just later.',
+    },
+    {
+      q: 'What does opening a screen do in KickHome, once the screen exists?',
+      options: [
+        'Creates the screen from scratch and adds it to the window',
+        'Hides every screen, then makes the chosen one visible and adjusts the bars',
+        'Starts a new process for that screen',
+        'Reloads the whole app',
+      ],
+      answer: 1,
+      why: 'All screens are children of the home component. setupLoadScreenVisibility hides them all and shows one.',
+    },
+  ]}
+/>
+
+## Words to know
+
+| Term | Meaning |
+|---|---|
+| JUCE | A C++ framework for audio apps and plugins. Gives windows, drawing, timers and audio device access |
+| JUCE module | A unit of source that CMake registers by name, such as `kick_ui` |
+| Message thread | The one thread that runs the UI event loop. Must never block |
+| Audio thread | The driver-called thread that fills audio buffers. Real-time rules apply |
+| Thread pool | A fixed set of worker threads that run queued jobs |
+| callAsync | JUCE call that queues a closure to run later on the message thread |
+| Singleton | An object of which only one exists, reachable from anywhere |
+| Signal / slot | A list of functions called when the signal fires. The observer pattern |
+| IScreen | The base class every screen implements |
+| Screen | The enum of every page the UI can show |
+| Monolith | One program that holds all the parts, versus several cooperating processes |
+| Supervisor | A process whose job is to start and watch others |
+
+Next: Module 5, the serial protocol (coming soon).

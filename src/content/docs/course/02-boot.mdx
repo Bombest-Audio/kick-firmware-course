@@ -1,0 +1,308 @@
+---
+title: '2. Boot'
+description: What happens between power-on and the first pad lighting up, one stage at a time, and where each stage lives in the repository.
+---
+
+import { Image } from 'astro:assets';
+import { Aside } from '@astrojs/starlight/components';
+import CodeRef from '../../../components/CodeRef.astro';
+import Quiz from '../../../components/Quiz.astro';
+import hero from '../../../assets/heroes/m02-boot.png';
+
+<Image src={hero} alt="A row of receding doorways, the nearest one glowing amber, each opening onto the next." />
+
+**Module 2 of 12 &#183; about 25 minutes &#183; needs Module 1**
+
+When you press power, nothing on the box knows how to be a drum machine yet. The main chip starts with a tiny program burned into it at the factory, and that program knows how to find the next program, which finds the next one. Six handoffs later the KICK app is running. If you want to replace any piece of the OS, you need to know which handoff you are touching.
+
+By the end you will be able to name the six stages, point to the file that defines each, and explain two small choices in the source that shape the boot experience.
+
+<Aside type="note" title="Analogy">
+A relay race. Each runner only has to carry the baton to the next runner, and each runner is built for a different distance. The first runner is short and fixed in place. The last runner carries the baton for as long as the machine is on. A custom OS swaps runners, never the race.
+</Aside>
+
+## The six handoffs
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>Boot ROM</b><span class="layer layer-hardware">hardware</span><br />Fixed code inside the chip. Finds the next stage.</div>
+    <div class="kd-step"><b>SPL</b><span class="layer layer-bootloader">bootloader</span><br />Small loader. Brings up RAM using the DDR firmware blob.</div>
+    <div class="kd-step"><b>U-Boot</b><span class="layer layer-bootloader">bootloader</span><br />Full bootloader, wrapped with ARM trusted firmware. Loads the kernel.</div>
+    <div class="kd-step"><b>Kernel</b><span class="layer layer-kernel">kernel</span><br />Linux. Reads the device tree, starts drivers.</div>
+    <div class="kd-step"><b>systemd</b><span class="layer layer-userspace">user space</span><br />Starts services in order, including the display server and the app.</div>
+    <div class="kd-step"><b>KICK app</b><span class="layer layer-userspace">user space</span><br />Opens the audio device, the serial links and the first screen.</div>
+  </div>
+  <figcaption>The colors match the layer palette from Start here. Stages 2 and 3 share a color because both are bootloader code.</figcaption>
+</figure>
+
+### Stages 1 to 3: ROM, SPL, U-Boot
+
+The first stage is not in this repository at all. It is mask ROM inside the chip, set when the silicon was made. From NXP's public documentation, not from this repository, it reads a boot image from a device such as eMMC or an SD card and runs it. I mark that as general i.MX knowledge, not something I verified in the source.
+
+What the repository does show is how the boot image is assembled. A script gathers the pieces and wraps them into one file:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/imx8-bootloader-prepare.sh" line={14} expect="u-boot-spl.bin ${BINARIES_DIR}/ddr_fw.bin">
+
+```sh
+cat ${BINARIES_DIR}/u-boot-spl.bin ${BINARIES_DIR}/ddr_fw.bin > ${BINARIES_DIR}/u-boot-spl-ddr.bin
+```
+
+</CodeRef>
+
+That line glues the SPL and `ddr_fw.bin` into one file, `u-boot-spl-ddr.bin`. `ddr_fw.bin` is the firmware that teaches the memory controller how to talk to the RAM chips. RAM cannot be used until that step runs, which is why the first loader must be tiny: it has to fit in the small on-chip memory that works before RAM does. Two lines later the script adds `bl31.bin`, the ARM trusted firmware, and builds the FIT image `u-boot.itb`:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/imx8-bootloader-prepare.sh" line={17} expect="u-boot.itb">
+
+```sh
+u-boot.itb
+```
+
+</CodeRef>
+
+The last step packs everything with `mkimage_imx8` into the single file the ROM looks for, named `imx8-boot-sd.bin` for the SD image:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/genimage.cfg.sd" line={58} expect="imx8-boot-sd.bin">
+
+```text
+imx8-boot-sd.bin
+```
+
+</CodeRef>
+
+### The first design choice: no boot delay
+
+U-Boot normally waits a few seconds so a person at a serial console can press a key and get a prompt. This build turns the wait off:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/u-boot/imx8mm_var_dart_defconfig" line={31} expect="CONFIG_BOOTDELAY=0">
+
+```text
+CONFIG_BOOTDELAY=0
+```
+
+</CodeRef>
+
+The trade-off is clear. The box starts faster, and a user cannot stumble into a bootloader prompt. But a developer who wants to recover a bad image loses the easy way in. The updates and recovery module, coming later, covers what recovery looks like when that door is closed. USB serial download mode is a separate path that general i.MX knowledge says still works at zero delay (not verified on hardware).
+
+### Stage 4: the kernel
+
+The boot partition holds a compressed kernel image and the device tree files that describe the board:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/genimage.cfg.sd" line={25} expect="Image.gz">
+
+```text
+Image.gz
+```
+
+</CodeRef>
+
+The device tree is how the kernel learns what hardware exists without probing for it. Module 1 pointed at the touchscreen entry in a patch to the tree. The tree names the chip, `goodix,gt911`, and its I2C address, `0x14`, so the Goodix driver can bind to it at startup.
+
+The kernel and U-Boot are not stored in this repository. The Buildroot configuration downloads them from forks pinned by commit:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={13} expect="BR2_LINUX_KERNEL">
+
+```text
+BR2_LINUX_KERNEL_CUSTOM_REPO_URL
+```
+
+</CodeRef>
+
+If you ever need a driver changed, the pinned fork is where the change lives. Module 3 shows how.
+
+### Stage 5: systemd
+
+The root filesystem uses systemd:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={5} expect="BR2_INIT_SYSTEMD=y">
+
+```text
+BR2_INIT_SYSTEMD=y
+```
+
+</CodeRef>
+
+systemd reads small text files called units. One unit mounts a disk, another starts a program, and they declare which ones must come first. The KICK ships its units in the root filesystem overlay, under `etc/systemd/system/`. Two of them matter for the app.
+
+The graphics side is Weston, a small display server. Its config asks for the GPU's 2D engine and hides the desktop panel, so the app owns the whole screen:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/xdg/weston/weston.ini" line={4} expect="use-g2d=1">
+
+```text
+use-g2d=1
+```
+
+</CodeRef>
+
+The app itself starts from `ktkick.service`:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/ktkick.service" line={10} expect="Restart=on-failure">
+
+```text
+Restart=on-failure
+```
+
+</CodeRef>
+
+Two lines in that unit shape how the app behaves. `Restart=on-failure` means that if the app crashes, systemd starts it again. And a CPU quota caps the service so it cannot starve the rest of the system. Per the systemd docs (general knowledge), 85% means 85% of one core for the whole service, and going over it throttles every thread in the service, the audio thread included:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/ktkick.service" line={14} expect="CPUQuota=85%">
+
+```text
+CPUQuota=85%
+```
+
+</CodeRef>
+
+The service does not run the binary directly. It runs a small shell script first.
+
+### The second design choice: sleep 15
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/usr/bin/kt_kick.sh" line={4} expect="sleep 15">
+
+```sh
+sleep 15
+```
+
+</CodeRef>
+
+The script waits 15 seconds, checks that the app binary exists, makes it executable, and runs it:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/usr/bin/kt_kick.sh" line={8} expect="/usr/bin/KT_Kick">
+
+```sh
+/usr/bin/KT_Kick
+```
+
+</CodeRef>
+
+A fixed sleep is a blunt tool. It gives slow dependencies, such as the display server and the audio card, time to come up without writing a dependency graph. The cost is that every boot spends 15 seconds idle, even when the dependencies were ready in two. A cleaner design would declare `After=` and `Requires=` in the unit and wait on the real conditions. That is a good first improvement to try in your own build, and I cannot say yet whether the stock timing is needed on real hardware, because I have not run one.
+
+### Stage 6: the app starts
+
+The program entry point is `Main.cpp`. When the JUCE framework calls `initialise`, the app builds the hardware adapter first:
+
+<CodeRef path="Kick/apps/kick/Main.cpp" line={134} expect="adapter.reset( new KickDeviceAdapter() )">
+
+```cpp
+adapter.reset( new KickDeviceAdapter() );
+```
+
+</CodeRef>
+
+After the adapter exists, the app loads settings, opens the audio interface and creates the home window. The home screen opens the first screen right away, with a signal:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppHome.cpp" line={207} expect="sigScreenOpen( Screen::RecentProject )">
+
+```cpp
+sigScreenOpen( Screen::RecentProject );
+```
+
+</CodeRef>
+
+The code then builds the other screens in one batch, queued after startup, so the first screen can show before the rest exist. A comment in the source calls this lazy creation, but nothing waits for a tap. Module 4 follows this path in detail.
+
+<Aside type="caution" title="Open question">
+The eMMC partition table file lists three images: the boot image, written raw and kept out of the partition table, then the root filesystem and a `usr` partition. That makes two real partition entries. But three mount units point at `/dev/mmcblk1p6`, `p7` and `p8`:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/opt.mount" line={8} expect="/dev/mmcblk1p6">
+
+```text
+/dev/mmcblk1p6
+```
+
+</CodeRef>
+
+Partitions 6 to 8 are not defined in the file I found. Either another partitioning step creates them, or those units are leftovers from a different layout. I could not resolve this from the repository, so I am leaving it open. Module 9 shows what those mounts hold (`/opt`, `/home/Kick` and `/data`), but not what creates the partitions. If you work that out, send a pull request to this page.
+</Aside>
+
+## Try it yourself
+
+With the upstream clone from Module 1 checked out at the pinned commit, trace the image build yourself:
+
+```bash
+cd Linux/buildroot/board/freescale/imx8mm_var_som
+cat imx8-bootloader-prepare.sh
+grep -n "image" genimage.cfg.sd
+cat rootfs_overlay/usr/bin/kt_kick.sh
+cat rootfs_overlay/etc/systemd/system/ktkick.service
+```
+
+Draw the boot as a flowchart on paper. Label each arrow with the file that causes the handoff. Then answer: if you wanted a faster boot, which two stages would you look at first, and what would you check before changing them?
+
+## Check yourself
+
+<Quiz
+  items={[
+    {
+      q: 'Why must the first loader (SPL) be small?',
+      options: [
+        'Small files boot faster over USB',
+        'It runs before RAM works, so it must fit in the chip’s small on-chip memory',
+        'The ROM rejects files over 1 MB',
+        'It has to share space with the kernel',
+      ],
+      answer: 1,
+      why: 'RAM needs the DDR firmware to be set up first. The SPL does that, so it has to run from memory that is available before RAM is.',
+    },
+    {
+      q: 'What does CONFIG_BOOTDELAY=0 give up in exchange for a faster start?',
+      options: [
+        'The ability to run the app',
+        'The easy window to interrupt U-Boot and get a prompt',
+        'Audio output',
+        'The device tree',
+      ],
+      answer: 1,
+      why: 'With no delay there is no moment to press a key, so a developer loses the simple way into the bootloader.',
+    },
+    {
+      q: 'What does Restart=on-failure do in ktkick.service?',
+      options: [
+        'Reboots the whole machine on a crash',
+        'Starts the app again if it exits with an error',
+        'Restarts only the display server',
+        'Deletes the app binary',
+      ],
+      answer: 1,
+      why: 'systemd restarts the service when it fails. The rest of the system keeps running.',
+    },
+    {
+      q: 'What is the cost of the fixed sleep 15 in kt_kick.sh?',
+      options: [
+        'The app runs slower',
+        'Every boot waits 15 seconds even if dependencies are ready sooner',
+        'The binary is deleted',
+        'Audio drifts',
+      ],
+      answer: 1,
+      why: 'A fixed wait is simple but wastes time. Declaring real dependencies in the unit would start the app as soon as they are ready.',
+    },
+    {
+      q: 'The kernel finds the Goodix touch chip at I2C address 0x14. Where does it learn that?',
+      options: [
+        'From the app at runtime',
+        'From a hardcoded table in U-Boot',
+        'From the device tree',
+        'From the audio codec',
+      ],
+      answer: 2,
+      why: 'The device tree lists each chip, its driver match string and its address, so the kernel can bind drivers at startup.',
+    },
+  ]}
+/>
+
+## Words to know
+
+| Term | Meaning |
+|---|---|
+| Boot ROM | Fixed code inside the chip that runs first |
+| SPL | Secondary Program Loader. A tiny first-stage loader that sets up RAM |
+| U-Boot | The bootloader that loads the kernel and device tree |
+| ATF / bl31 | ARM Trusted Firmware, the secure-world runtime that U-Boot packages with |
+| FIT image | A container file holding several images plus a description of how to load them |
+| Device tree | Data file describing the board's hardware to the kernel |
+| systemd | The init system. Reads unit files and starts services in order |
+| Unit | One systemd config file, such as a service or a mount |
+| Weston | A small Wayland display server |
+
+Next: Module 3, Embedded Linux and Buildroot (coming soon).

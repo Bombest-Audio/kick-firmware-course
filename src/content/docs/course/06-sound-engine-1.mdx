@@ -1,0 +1,1161 @@
+---
+title: '6. Sound engine I: objects and the audio callback'
+description: What real-time audio demands, how the KICK builds sound from small AudIO objects, how one buffer travels from the audio device through the object graph, and where the stock code breaks its own real-time rules.
+---
+
+import { Image } from 'astro:assets';
+import { Aside } from '@astrojs/starlight/components';
+import CodeRef from '../../../components/CodeRef.astro';
+import Quiz from '../../../components/Quiz.astro';
+import hero from '../../../assets/heroes/m06-sound-engine-1.png';
+
+<Image src={hero} alt="A glowing violet waveform runs through a row of small dark gates." />
+
+**Module 6 of 12 &#183; about 40 minutes &#183; needs Module 4**
+
+Every few milliseconds the sound hardware runs out of audio and asks for more. The program has to hand it a fresh block before the old one finishes playing. Miss that deadline once and you hear a click. This lesson is about the code that lives under that deadline.
+
+By the end you will be able to do four things. Compute the time budget for one block of audio. Explain what an `AudIO::Object` is and how one gets created and wired up. Trace one block from the audio device down through the object graph and back. And point at specific lines in the stock code that break the rules real-time audio depends on, and say how a custom OS could fix them.
+
+<Aside type="note" title="Analogy">
+A bakery with a conveyor belt that never stops. Every 10 milliseconds an empty tray reaches the end of the belt and a customer takes it. The baker has to fill each tray before it arrives. A tray that arrives half empty is a hole in the music. The baker can be the fastest in town and still fail, because one slow tray is enough. And the baker may not stop to look for flour in the storeroom, ask a coworker to unlock a drawer, or phone the supplier. Everything the tray needs must already be within arm's reach.
+</Aside>
+
+## What real-time audio means
+
+Sound on a computer is a stream of numbers called samples. At 48 kHz there are 48,000 samples per second per channel. The KICK's audio device is configured for 48 kHz and 32-bit samples:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/asound.conf" line={27} expect="format S32_LE">
+
+```text
+format S32_LE
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/asound.conf" line={28} expect="rate 48000">
+
+```text
+rate 48000
+```
+
+</CodeRef>
+
+`S32_LE` means signed 32-bit integer, little-endian (ALSA's naming, general knowledge). The program does not hand the hardware one sample at a time. That would mean 48,000 wake-ups per second. It works in **blocks**, also called buffers or periods: a chunk of consecutive samples, such as 480 of them. The audio driver wakes the program once per block and says "fill this."
+
+The arithmetic is short:
+
+```text
+time per block = frames per block / sample rate
+per-frame budget = 1 / 48,000 s = about 20.8 microseconds
+```
+
+A **frame** is one sample for every channel at the same instant. For stereo, one frame is two samples.
+
+### How big is the KICK's block?
+
+I could not find out. The block size the app asks for is a constant named `AUDIO_BLOCK_SIZE`:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={61} expect="engine.startAudioDevice( AUDIO_SAMPLE_RATE, AUDIO_BLOCK_SIZE );">
+
+```cpp
+engine.startAudioDevice( AUDIO_SAMPLE_RATE, AUDIO_BLOCK_SIZE );
+```
+
+</CodeRef>
+
+That constant is defined in a module called `AudIO_constants`. The public repository does not contain that module. A search of the pinned commit finds the constant used, never defined. So I cannot give you the real number.
+
+What I can give you is a ceiling. The audio engine clamps whatever it is asked for:
+
+<CodeRef path="AudIO/AudIO/Daw/DawEngine.cpp" line={22} expect="#define BLOCK_SIZE    ( 480 )">
+
+```cpp
+#define BLOCK_SIZE    ( 480 )
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Daw/DawEngine.cpp" line={187} expect="utils::min( BlockSize">
+
+```cpp
+unsigned int blkSize = utils::min( BlockSize, (unsigned int)BLOCK_SIZE );
+```
+
+</CodeRef>
+
+So the real block is at most 480 frames. The example program that ships with the library asks for exactly that:
+
+<CodeRef path="AudIO/AudIO/Example/Daw/DawExampleMain.cpp" line={33} expect="startAudioDevice( 48000, 480 )">
+
+```cpp
+_eng.startAudioDevice( 48000, 480 );
+```
+
+</CodeRef>
+
+Here is the budget at a few sizes. **Only the 480 row is grounded in the code** (a cap and an example). The other rows show how the deadline scales. The 960 row comes from a different example in the same folder, and the small rows are textbook sizes I picked.
+
+| Frames per block | Time to the deadline at 48 kHz | Source of the size |
+|---|---|---|
+| 64 | 1.33 ms | Example only, my pick |
+| 128 | 2.67 ms | Example only, my pick |
+| 480 | 10 ms | Ceiling in `DawEngine.cpp`, and the library's DAW example |
+| 960 | 20 ms | `BasicUsage` example, shown below |
+
+<CodeRef path="AudIO/AudIO/Example/BasicUsage/Main.cpp" line={46} expect="#define BLOCK_SIZE    960">
+
+```cpp
+#define BLOCK_SIZE    960
+```
+
+</CodeRef>
+
+Three things follow from the table.
+
+- **Bigger blocks are easier to hit and slower to hear.** A 480-frame block means a key press can wait up to 10 ms before the engine even starts on it (general knowledge about buffering latency). Smaller blocks cut that wait but shrink the deadline.
+- **The worst block matters, not the average.** If your code takes 1 ms on most blocks and 15 ms on one, you hear one click. A fast average is no comfort.
+- **One block is small in bytes.** 480 frames of stereo at 4 bytes per sample is 3,840 bytes. The cost is not the data. The cost is that everything must happen on schedule.
+
+## Two threads and the rules for the second
+
+Module 4 introduced the **message thread**: it runs the screen, and it may be slow for a moment without breaking anything but the picture. The **audio thread** is the other one. The audio driver calls into your code on it, once per block. JUCE's own comment on the audio callback says so plainly:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_sample_player.h" line={55} expect="high-priority system thread">
+
+```text
+It will generally be called on a high-priority system thread, or possibly even
+```
+
+</CodeRef>
+
+The rule for this thread is simple to say and hard to follow: **it must finish every block in bounded time, every time.** Anything whose duration you cannot bound is banned. These are the standard bans (general real-time audio knowledge, not from this repository):
+
+| Banned on the audio thread | Why it can blow the deadline |
+|---|---|
+| Blocking locks | If another thread holds the lock, the audio thread waits for however long that thread takes. Worse, a low-priority thread can hold the lock while a medium-priority thread keeps stealing its CPU time. The audio thread, the most important one, then waits on the least important. That is called **priority inversion**. |
+| Allocation and freeing (`new`, `delete`, `malloc`, growing a vector) | The allocator may take its own lock and may ask the kernel for more memory. Neither has a time limit. |
+| File and network I/O | A disk or a socket answers when it answers. A flash read that takes 2 ms usually might take 40 ms once. |
+| Logging (`printf`, `std::cout`, writing a log file) | It is I/O and often takes a lock on the stream. |
+
+Notice what is not banned: arithmetic, reading and writing memory you already own, and **atomic** operations. An atomic is a variable the CPU updates in one indivisible step, so another thread never sees it half-written. Atomics never make a thread wait. The rest of this lesson is the story of what you use *instead* of the banned things.
+
+## AudIO::Object: one box in the sound graph
+
+The sound engine is a library called **AudIO** that lives in the `AudIO/` folder. Its basic building block is the **object**: one box that takes in some audio, does one job, and sends out some audio. A sine oscillator is an object. A mixer is an object. A reverb is an object.
+
+### The interface
+
+Every object promises to do two things. It must get ready, and it must process a buffer. That promise is a tiny interface:
+
+<CodeRef path="AudIO/AudIO/Includes/IProcessable.h" line={7} expect="struct IProcessable">
+
+```cpp
+struct IProcessable
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Includes/IProcessable.h" line={10} expect="virtual void process( Buffer">
+
+```cpp
+virtual void process( Buffer<float>& Buffer )                         = 0;
+```
+
+</CodeRef>
+
+The `= 0` makes it a **pure virtual** function: the base class declares it and every concrete class must supply its own. The `Object` class builds on it:
+
+<CodeRef path="AudIO/AudIO/Includes/AudioObject.h" line={11} expect="class Object : public IProcessable">
+
+```cpp
+class Object : public IProcessable
+```
+
+</CodeRef>
+
+An object is born knowing how many audio inputs, audio outputs and parameters it has:
+
+<CodeRef path="AudIO/AudIO/Includes/AudioObject.h" line={16} expect="Object( uint32_t ninputs, uint32_t noutputs, uint32_t nparam )">
+
+```cpp
+Object( uint32_t ninputs, uint32_t noutputs, uint32_t nparam )
+```
+
+</CodeRef>
+
+It also remembers a sample rate and a block size. The defaults are worth noticing. The sample rate defaults to 48,000 and the block size to 1, a placeholder until real values arrive:
+
+<CodeRef path="AudIO/AudIO/Includes/AudioObject.h" line={86} expect="_sampleRate{ 48000 }">
+
+```cpp
+uint32_t       _sampleRate{ 48000 }; // Default sample rate...
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Includes/AudioObject.h" line={87} expect="_blockSize{ 1 }">
+
+```cpp
+uint32_t       _blockSize{ 1 };
+```
+
+</CodeRef>
+
+The real values arrive through `prepareToPlay`, which the engine calls before sound starts, off the audio deadline:
+
+<CodeRef path="AudIO/AudIO/Includes/AudioObject.h" line={39} expect="virtual void prepareToPlay( uint32_t samplerate, uint32_t blocksize )">
+
+```cpp
+virtual void prepareToPlay( uint32_t samplerate, uint32_t blocksize )
+```
+
+</CodeRef>
+
+That split is the whole philosophy in miniature. **Allocate and set up in `prepareToPlay`. Only compute in `process`.**
+
+### A real one: SineWave
+
+The smallest useful object is a sine-wave generator. Its constructor says: zero inputs, two outputs, and as many parameters as the enum lists.
+
+<CodeRef path="AudIO/AudIO/Objects/SineWave.h" line={21} expect=": Object( 0, 2, SineWave::kParamMax )">
+
+```cpp
+: Object( 0, 2, SineWave::kParamMax )
+```
+
+</CodeRef>
+
+Its `process` fills the output buffers. First it asks how many samples this block holds:
+
+<CodeRef path="AudIO/AudIO/Objects/SineWave.cpp" line={150} expect="auto nSamples = buffer.getBlockSize();">
+
+```cpp
+auto nSamples = buffer.getBlockSize();
+```
+
+</CodeRef>
+
+Then one loop runs once per frame. Each pass takes one value from an oscillator and scales it by a smoothed amplitude:
+
+<CodeRef path="AudIO/AudIO/Objects/SineWave.cpp" line={153} expect="m_amplitude.getNext() * m_lfo.process()">
+
+```cpp
+auto sineOut = m_amplitude.getNext() * m_lfo.process();
+```
+
+</CodeRef>
+
+Look at what this function does not do. It does not allocate. It does not lock. It does not print. It writes into memory that already exists. That is what a good audio-thread function looks like.
+
+### The KICK's own objects are AudIO objects
+
+The sampler and drum programs in the KICK app are not a separate system. The class that plays a program is itself an `AudIO::Object`:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.h" line={29} expect="class ISynthObject : public AudIO::Object">
+
+```cpp
+class ISynthObject : public AudIO::Object
+```
+
+</CodeRef>
+
+Its `process` clears the output, runs each voice, then the effect inserts, then the program's master gain:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={194} expect="for( auto& it : voices )">
+
+```cpp
+for( auto& it : voices )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={195} expect="process( bufferToFill );">
+
+```cpp
+it->process( bufferToFill );
+```
+
+</CodeRef>
+
+A **voice** is one playing sound, such as one drum hit. Module 7 is not written yet, so I will keep this to what the audio thread needs to know.
+
+## The factory: how objects get created
+
+Say the app wants "a SineWave" without the code asking for it knowing the class. The engine can create objects by **name**, through a registry called the `ObjectFactory`.
+
+There are two halves. The first is registration. Each object's header ends with one macro line:
+
+<CodeRef path="AudIO/AudIO/Objects/SineWave.h" line={45} expect={`REGISTER_OBJECT( "SineWave", SineWave );`}>
+
+```cpp
+REGISTER_OBJECT( "SineWave", SineWave );
+```
+
+</CodeRef>
+
+The macro is defined in the factory header. It declares a file-scope `static` variable whose constructor does the registering:
+
+<CodeRef path="AudIO/AudIO/Includes/ObjectFactory.h" line={11} expect="#define REGISTER_OBJECT( type, Object )">
+
+```cpp
+#define REGISTER_OBJECT( type, Object )                                   static AudIO::ObjectFactoryRegistration<Object> _##Object( type )
+```
+
+</CodeRef>
+
+C++ constructs file-scope statics before `main` runs (general C++ knowledge). So by the time the program starts, every registered name is already in the table. The registration constructor stores a small function that builds one object on demand:
+
+<CodeRef path="AudIO/AudIO/Includes/ObjectFactory.h" line={101} expect="std::make_unique">
+
+```cpp
+[]() { return std::make_unique<T>(); } );
+```
+
+</CodeRef>
+
+The registry itself is a single global, built on first use:
+
+<CodeRef path="AudIO/AudIO/Includes/ObjectFactory.h" line={34} expect="static ObjectFactory& Get()">
+
+```cpp
+static ObjectFactory& Get()
+```
+
+</CodeRef>
+
+The second half is creation. `Create` looks the name up and calls the stored function. It holds a lock while it does:
+
+<CodeRef path="AudIO/AudIO/Includes/ObjectFactory.h" line={61} expect="Create( const std::string& type )">
+
+```cpp
+std::unique_ptr<Object> Create( const std::string& type )
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Includes/ObjectFactory.h" line={63} expect="autolock guard{ m_lock };">
+
+```cpp
+autolock guard{ m_lock };
+```
+
+</CodeRef>
+
+That lock and the heap allocation inside `make_unique` are fine here, because creation is a message-thread job. A creation on the audio thread would break two rules at once. The design only works if nobody ever does that. Keep it in mind for the findings below.
+
+The design calls the factory through a macro:
+
+<CodeRef path="AudIO/AudIO/Includes/ObjectFactory.h" line={16} expect="#define CREATE_OBJECT( Type )">
+
+```cpp
+#define CREATE_OBJECT( Type )                                             AudIO::ObjectFactory::Get().Create( Type )
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Core/Design.cpp" line={84} expect="auto obj = CREATE_OBJECT( type );">
+
+```cpp
+auto obj = CREATE_OBJECT( type );
+```
+
+</CodeRef>
+
+## The graph: how objects connect
+
+Objects live inside a **Design**, a container that owns them and decides the order they run in. A `Design` is itself an `Object`, so designs can nest inside designs:
+
+<CodeRef path="AudIO/AudIO/Includes/Design.h" line={12} expect="class Design : public Object">
+
+```cpp
+class Design : public Object
+```
+
+</CodeRef>
+
+The KICK's engine class is a design too, which is why it can be handed to the audio device as the thing to call:
+
+<CodeRef path="AudIO/AudIO/Daw/DawEngine.h" line={32} expect="class DawEngine : public Design">
+
+```cpp
+class DawEngine : public Design
+```
+
+</CodeRef>
+
+The KICK app owns exactly one engine, as a member of its audio manager:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.h" line={109} expect="AudIO::DawEngine engine{">
+
+```cpp
+AudIO::DawEngine engine{ AUDIO_NUM_INPUTS, AUDIO_NUM_OUTPUTS, AUDIO_NUM_SEND_RETURNS, AUDIO_NUM_SUBMIX, AUDIO_NUM_AUX };
+```
+
+</CodeRef>
+
+### Patching
+
+Connecting one object's output to another's input is **patching**, a name borrowed from patch cables. The public call takes the source object, the source channel, the destination object and the destination channel:
+
+<CodeRef path="AudIO/AudIO/Core/Design.cpp" line={433} expect="bool Design::patch( uint32_t srcid, uint32_t srcch, uint32_t dstid, uint32_t dstch )">
+
+```cpp
+bool Design::patch( uint32_t srcid, uint32_t srcch, uint32_t dstid, uint32_t dstch )
+```
+
+</CodeRef>
+
+Underneath, each object is wrapped in a small record called `objectMeta`. It holds the object's buffer and a map of who it feeds:
+
+<CodeRef path="AudIO/AudIO/Core/ObjectMeta.h" line={158} expect="_buffer;">
+
+```cpp
+Buffer<float>                                                           _buffer;
+```
+
+</CodeRef>
+
+Patching records the link, then asks a queue to point the destination's input at the source's output memory:
+
+<CodeRef path="AudIO/AudIO/Core/ObjectMeta.h" line={72} expect="::get().patchInput(">
+
+```cpp
+PatchQueue<float>::get().patchInput( &dstmeta.getBuffer(), block, dstch );
+```
+
+</CodeRef>
+
+No audio is copied when you patch. Two buffers simply share a block of memory. After linking, the design refuses any connection that makes a loop, since a loop would mean an object waiting on its own output:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={155} expect="if( isCyclic() )">
+
+```cpp
+if( isCyclic() )
+```
+
+</CodeRef>
+
+Then it marks the design **dirty**, which means "the run order may be stale":
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={160} expect="_dirty.store( true );">
+
+```cpp
+_dirty.store( true );
+```
+
+</CodeRef>
+
+### The run order
+
+Objects must run in an order where every object runs after the ones feeding it. This is a **topological sort**, a standard graph algorithm (general knowledge). The result is a vector called `_dfs`, a name taken from the depth-first search that builds it:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.h" line={133} expect="_dfs;">
+
+```cpp
+std::vector<objectMeta*>           _dfs;
+```
+
+</CodeRef>
+
+At every block the design walks that vector front to back and tells each object to process:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={60} expect="for( auto obj : _dfs )">
+
+```cpp
+for( auto obj : _dfs )
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={63} expect="process();">
+
+```cpp
+obj->process();
+```
+
+</CodeRef>
+
+The record then hands its own buffer to the real object:
+
+<CodeRef path="AudIO/AudIO/Core/ObjectMeta.h" line={45} expect="_object.process( _buffer );">
+
+```cpp
+_object.process( _buffer );
+```
+
+</CodeRef>
+
+### Where the buffers come from
+
+Audio buffers are not allocated one by one. The engine reserves one big static array at startup and carves it into fixed-size blocks:
+
+<CodeRef path="AudIO/AudIO/Daw/DawEngine.cpp" line={21} expect="#define MEM_POOL_SIZE ( 2500 )">
+
+```cpp
+#define MEM_POOL_SIZE ( 2500 )
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Daw/DawEngine.cpp" line={27} expect="float _audioPoolMemBuffer[( MEM_POOL_SIZE * BLOCK_SIZE )];">
+
+```cpp
+float _audioPoolMemBuffer[( MEM_POOL_SIZE * BLOCK_SIZE )];
+```
+
+</CodeRef>
+
+That is 2,500 blocks of 480 floats: 1,200,000 floats, or about 4.8 MB at 4 bytes each. A comment above it warns that the array must be big enough for the worst-case design, because nothing grows it later. A fixed **memory pool** like this is the textbook answer to "no allocation on the audio thread." Getting a buffer means taking a free slot from a list you already own.
+
+## The audio callback path, device to objects and back
+
+Now put the pieces in order. This is the path one block takes. It starts with the message thread setting things up, then the audio thread repeating the same walk forever.
+
+**Setup (message thread).** The audio manager creates the audio device object and starts the engine. It does this inside a `callAsync`, the same hop you met in Module 4:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={56} expect="AUDIO_NUM_INPUTS, AUDIO_NUM_OUTPUTS, juce::String()">
+
+```cpp
+dm = std::make_unique<AudioDevice>( AUDIO_NUM_INPUTS, AUDIO_NUM_OUTPUTS, juce::String() );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager.cpp" line={60} expect="engine.addAudioDevice(">
+
+```cpp
+engine.addAudioDevice( "Master", dm.get(), true );
+```
+
+</CodeRef>
+
+Adding the device as "master" points the device at the device manager as its callback:
+
+<CodeRef path="AudIO/AudIO/Includes/DeviceManager.h" line={51} expect="setCallback( this );">
+
+```cpp
+_master->setCallback( this );
+```
+
+</CodeRef>
+
+And the engine's constructor pointed the device manager at the engine itself:
+
+<CodeRef path="AudIO/AudIO/Daw/DawEngine.cpp" line={86} expect="_devmgr.setAudioCallback( this );">
+
+```cpp
+_devmgr.setAudioCallback( this );
+```
+
+</CodeRef>
+
+**One block (audio thread).** When the hardware wants audio, the device's callback runs. Each hop in the chain just forwards the buffer to the next. First the device to the device manager:
+
+<CodeRef path="AudIO/AudIO/Includes/IAudioDevice.h" line={58} expect="process( buf );">
+
+```cpp
+ptr->process( buf );
+```
+
+</CodeRef>
+
+Then the device manager to whatever is listening, which is the engine:
+
+<CodeRef path="AudIO/AudIO/Includes/DeviceManager.h" line={90} expect="process( Buffer );">
+
+```cpp
+ptr->process( Buffer );
+```
+
+</CodeRef>
+
+The engine, as a `Design`, first drains the patch queue (more on it soon), then runs the graph:
+
+<CodeRef path="AudIO/AudIO/Core/Design.cpp" line={43} expect="::get().process();">
+
+```cpp
+PatchQueue<float>::get().process();
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Core/Design.cpp" line={46} expect="process( Buffer );">
+
+```cpp
+pImpl->process( Buffer );
+```
+
+</CodeRef>
+
+`DesignImpl::process` walks `_dfs` as you saw. Then it copies the final object's output into the device buffer, scaled by an output gain:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={75} expect="utils::copyWithGain( dst, src, size, dOutGain );">
+
+```cpp
+utils::copyWithGain( dst, src, size, dOutGain );
+```
+
+</CodeRef>
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>Audio device</b><span class="layer layer-audio">audio thread</span><br />Driver wakes the callback once per block.</div>
+    <div class="kd-step"><b>IAudioDevice</b><span class="layer layer-audio">audio thread</span><br />Forwards the buffer to its callback.</div>
+    <div class="kd-step"><b>DeviceManager</b><span class="layer layer-audio">audio thread</span><br />Forwards to the engine.</div>
+    <div class="kd-step"><b>Design::process</b><span class="layer layer-audio">audio thread</span><br />Drains the patch queue, then runs the graph.</div>
+    <div class="kd-step"><b>Each object in _dfs</b><span class="layer layer-audio">audio thread</span><br />Voices, inserts, mixers, in sorted order.</div>
+    <div class="kd-step"><b>Output copy</b><span class="layer layer-audio">audio thread</span><br />Final buffer goes back to the device.</div>
+  </div>
+  <figcaption>One block, top to bottom. Every box runs inside the deadline.</figcaption>
+</figure>
+
+<Aside type="caution" title="A gap in the public source">
+The device in the KICK is an `AudioDevice` class that wraps JUCE's audio device system. It lives in a module called `AudIO_juce`, and that module is not in the public repository. The common headers also name `AudIO_constants`, which is missing too:
+
+<CodeRef path="Kick/modules/common/common.h" line={17} expect="AudIO_constants">
+
+```text
+dependencies:       signal, fpm, magic_enum, AudIO_constants, juce_gui_basics
+```
+
+</CodeRef>
+
+So I cannot cite the top box of the diagram in the KICK build. The hops from `IAudioDevice::process` downward are real code I read. How JUCE's callback reaches `IAudioDevice::process` is my inference from the class shape and general JUCE knowledge. The public folder also contains a reference device for desktop testing, `StereoOut`, that calls `doProcess()`, and I could not find `doProcess` defined anywhere in the tree:
+
+<CodeRef path="AudIO/AudIO/Devices/StereoOut.cpp" line={67} expect="doProcess();">
+
+```cpp
+doProcess();
+```
+
+</CodeRef>
+
+The public AudIO folder is partial and slightly out of step with itself. Treat it as a map of the design, not a buildable snapshot.
+</Aside>
+
+### How the message thread talks to the audio thread
+
+The graph is edited from outside the audio thread: a screen adds an object, the user patches a cable. But the audio thread is the only one allowed to touch the live graph. The solution is a **queue**. The message thread drops a request in, and the audio thread picks it up at the top of the next block. The queue is declared with room for 64 requests:
+
+<CodeRef path="AudIO/AudIO/Core/PatchQueue.h" line={106} expect="_queue;">
+
+```cpp
+SPSCQUeue<PatchData<T>, 64> _queue;
+```
+
+</CodeRef>
+
+`SPSC` means single producer, single consumer: exactly one thread writes and exactly one thread reads. That restriction is what makes it possible to build the queue without any lock. I will explain how in the section on fixes.
+
+<figure class="kd">
+  <div class="kd-row two">
+    <div class="kd-node layer-message"><b>Message thread</b>edits the graph</div>
+    <div class="kd-wire control"><span>request queue</span></div>
+    <div class="kd-node layer-audio"><b>Audio thread</b>applies it at the next block</div>
+  </div>
+  <div class="kd-legend"><span><i></i>data</span><span><i class="control"></i>control</span><span><i class="clock"></i>clock</span></div>
+  <figcaption>The only safe road between the two threads: a queue that neither side ever waits on.</figcaption>
+</figure>
+
+### One more callback
+
+There is a second, separate audio callback in the app. The sample editor's preview player registers itself straight with the JUCE device manager:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_sample_player.cpp" line={32} expect="devmgr.addAudioCallback( &player );">
+
+```cpp
+devmgr.addAudioCallback( &player );
+```
+
+</CodeRef>
+
+JUCE lets several callbacks share one device and calls them in turn on the same thread (general JUCE knowledge). That matters, because anything slow in this second callback delays everything else. The next section comes back to it.
+
+## Where the stock code breaks the rules
+
+I read the path from `DesignImpl::process` outward and looked for the four banned things. Everything below is from reading source. I did not run any of it, and I did not measure how long any of it takes on the device. That is why each citation carries the "Not verified on hardware" badge.
+
+Some of this matches the codebase notes in `CONCERNS.md`. Where I rely on a note instead of my own reading, I say so.
+
+### First, what the code gets right
+
+The authors clearly knew the rules. Four things are done well:
+
+- Graph buffers come from a preallocated pool (shown above).
+- Edits that add patches go through a lock-free queue instead of a lock.
+- A voice's state is an atomic, not a mutex-guarded field:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.h" line={81} expect="state{ State::FREE };">
+
+```cpp
+std::atomic<State> state{ State::FREE };
+```
+
+</CodeRef>
+
+- A voice's scratch buffer is a member, sized once, not a new buffer per block:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.h" line={73} expect="tempBuffer{ 2, AUDIO_BLOCK_SIZE };">
+
+```cpp
+juce::AudioBuffer<float>   tempBuffer{ 2, AUDIO_BLOCK_SIZE };
+```
+
+</CodeRef>
+
+The voice list is a vector filled at setup time, and the audio thread only loops over it (the loop is above). Starting a note flips the atomic state; no memory is created. That is the pattern to copy.
+
+### Finding 1: the callback frees and allocates memory
+
+This is the big one. The top of `DesignImpl::process` runs three housekeeping calls on every block:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={34} expect="handleClearDesign();">
+
+```cpp
+handleClearDesign(); // delete everything if marked for clear
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={35} expect="processRemoveQueue();">
+
+```cpp
+processRemoveQueue(); // delete any objects marked for remove
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={36} expect="topologicalSort();">
+
+```cpp
+topologicalSort(); // sort design for processing
+```
+
+</CodeRef>
+
+The first two are guarded by flags and queues, so on most blocks they do nothing. But when the user removes an object, the audio thread is the one that deletes it. The removal request travels through a small queue:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={230} expect="_removeQueue.push( id );">
+
+```cpp
+_removeQueue.push( id );
+```
+
+</CodeRef>
+
+and `handleRemove`, called from the audio thread, erases the object from its owning containers. Erasing a `unique_ptr` runs the object's destructor and frees its memory:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={437} expect="_objectPointers.erase( objit );">
+
+```cpp
+_objectPointers.erase( objit );
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={447} expect="_objects.erase( id );">
+
+```cpp
+_objects.erase( id );
+```
+
+</CodeRef>
+
+The clear-everything path does the same on a bigger scale, emptying every container:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={479} expect="_objects.clear();">
+
+```cpp
+_objects.clear();
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={480} expect="_objectPointers.clear();">
+
+```cpp
+_objectPointers.clear();
+```
+
+</CodeRef>
+
+The third call sorts the graph again whenever it is dirty, which every patch and every insert makes it:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={328} expect="if( !_dirty.load() )">
+
+```cpp
+if( !_dirty.load() )
+```
+
+</CodeRef>
+
+The sort resizes its result vector, which allocates when the graph has grown past the vector's old capacity:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={335} expect="_dfs.resize( _objects.size() );">
+
+```cpp
+_dfs.resize( _objects.size() );
+```
+
+</CodeRef>
+
+So an edit on the screen can cause a free or an allocation inside the next audio block, and the sort's cost grows with the size of the graph, not the size of the block. The codebase notes flag the same functions (`CONCERNS.md`, "Real-Time Audio Safety"). Whether it ever glitches on a real unit depends on how large the graphs get and how fast the allocator is. I did not measure either.
+
+### Finding 2: the lock protects the wrong side
+
+Every public edit function on `Design` takes a recursive mutex:
+
+<CodeRef path="AudIO/AudIO/Core/Design.cpp" line={93} expect="autolock guard{ lockerMutex };">
+
+```cpp
+autolock guard{ lockerMutex };
+```
+
+</CodeRef>
+
+`autolock` is an alias for `std::scoped_lock` on a recursive mutex:
+
+<CodeRef path="AudIO/AudIO/Includes/Platform.h" line={8} expect="using autolock = std::scoped_lock">
+
+```cpp
+using autolock = std::scoped_lock<recursive_mutex>;
+```
+
+</CodeRef>
+
+`Design::process`, which you read above, takes no lock at all. That is deliberate and good: the audio thread never waits. But it means the mutex only serializes the editors against each other. It does not protect the graph from the callback. Here is my reading of the consequence. `topologicalSort` walks the `_objects` map on the audio thread:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={330} expect="for( auto& [id, objMeta] : _objects )">
+
+```cpp
+for( auto& [id, objMeta] : _objects )
+```
+
+</CodeRef>
+
+while `insertObject` adds to the same map from whichever thread made the edit:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={203} expect="_objects.emplace( obj.getId(), obj );">
+
+```cpp
+_objects.emplace( obj.getId(), obj );
+```
+
+</CodeRef>
+
+Two threads, one container, no common lock. In C++ that is a data race, and its behavior is undefined. The notes say the same (`CONCERNS.md`) and recommend adding or removing objects only while the device is stopped, or swapping graph snapshots between blocks. I have not made it fail.
+
+### Finding 3: shared counters that are not atomic
+
+The buffer pool keeps a reference count per block and a count of free blocks. They are plain integers:
+
+<CodeRef path="AudIO/AudIO/Includes/MemoryPool.h" line={146} expect="refCounts_;">
+
+```cpp
+std::vector<int> refCounts_;
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Includes/MemoryPool.h" line={150} expect="unsigned int     free_{ 0 };">
+
+```cpp
+unsigned int     free_{ 0 };
+```
+
+</CodeRef>
+
+The audio thread changes them when it drains the patch queue and a patch is applied, because applying a patch releases one block and acquires another:
+
+<CodeRef path="AudIO/AudIO/Includes/AudIOBuffer.h" line={300} expect="::get().release( *container );">
+
+```cpp
+MemoryPool<T>::get().release( *container );
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Includes/AudIOBuffer.h" line={302} expect="::get().acquire( block );">
+
+```cpp
+*container            = MemoryPool<T>::get().acquire( block );
+```
+
+</CodeRef>
+
+The edit side acquires pool blocks too, when it creates an object with outputs. Pool counters touched from two threads with no lock and no atomics is another data race. The mechanism is my reading of the call chain. The notes list it as well.
+
+### Finding 4: a full queue drops work and says nothing
+
+`SPSCQUeue::push` returns false when the queue is full:
+
+<CodeRef path="AudIO/AudIO/Core/SPSCQueue.h" line={14} expect="if (newWritePos == readPos.load())">
+
+```cpp
+if (newWritePos == readPos.load())
+```
+
+</CodeRef>
+
+The patch queue calls it and ignores the answer:
+
+<CodeRef path="AudIO/AudIO/Core/PatchQueue.h" line={86} expect="_queue.push( data );">
+
+```cpp
+_queue.push( data );
+```
+
+</CodeRef>
+
+If more patch requests arrive in one block than the queue holds, the extras vanish and the cable never connects. With 64 slots and the empty-slot rule explained below, the limit is 63 requests in flight. A script that patches hundreds of cables in one go could hit it. I have not tried.
+
+### Finding 5: file reads inside an audio callback
+
+The sample editor's preview player reads straight from the file inside its audio callback, in both playback directions:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_sample_player.cpp" line={157} expect="bufferToFill.buffer, 0, sampleCopySize">
+
+```cpp
+reader->read( bufferToFill.buffer, 0, sampleCopySize, pos, true, true );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_sample_player.cpp" line={164} expect="bufferToFill.buffer, 0, sampleCopySize">
+
+```cpp
+reader->read( bufferToFill.buffer, 0, sampleCopySize, pos, true, true );
+```
+
+</CodeRef>
+
+That is file I/O on a thread that must never wait for a disk. The callback also tells the message thread about progress from the same function:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_sample_player.cpp" line={173} expect="sendChangeMessage();">
+
+```cpp
+sendChangeMessage();
+```
+
+</CodeRef>
+
+I did not read JUCE's implementation of `sendChangeMessage`, so I will not say what it costs. The notes recommend preloading the sample into memory or wrapping the reader in JUCE's buffering source. This only affects the sample editor preview, not the main engine, which plays slices already loaded in memory.
+
+### What I looked for and did not find
+
+- **Logging in the callback path.** The only `std::cout` calls in `DesignImpl.cpp`, `Chain.cpp` and `Design.cpp` sit inside a `DEBUG_PRINTS` guard. Here is the one inside the removal path:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={450} expect="defined( DEBUG_PRINTS )">
+
+```cpp
+#if defined( DEBUG_PRINTS ) && ( DEBUG_PRINTS > 0 )
+```
+
+</CodeRef>
+
+I found no definition of `DEBUG_PRINTS` in the pinned tree, so the print is compiled out unless a build flag turns it on. The two prints in `StereoInOut.cpp` are in `start()`, not in the per-block function. The notes say some prints are unguarded; at this commit I could not reproduce that. Treat that note as out of date until someone re-checks.
+
+- **Locks inside the voice loop.** The voice code I read uses atomics. The Kick sequencer classes do use `juce::CriticalSection` locks (`mt_audio_note.cpp`, `mt_audio_sequence.cpp` and others), but I did not trace which thread calls them. The sequencer ticks on its own thread, not the audio callback, so I make no claim either way.
+
+## Why it matters, and what a custom OS could fix
+
+Most of the time none of the findings above shows up. The graph is stable, nobody is editing, and every block takes a fraction of its deadline. The trouble comes in bursts: right when the user drags a cable, deletes a track, or loads a project, which is exactly when the app is also redrawing, reading files and waking the kernel. Real-time bugs hide until the machine is busy. A stage that works 999 blocks in 1,000 sounds fine in the demo and clicks in front of the customer.
+
+Here is how to fix each class of problem, written so a smart high-school reader can follow every step.
+
+### 1. Never wait: lock-free queues
+
+A queue between two threads normally needs a lock so they do not trip over each other. But the codebase already contains a queue that needs none. Here is `push` and `pop` in `SPSCQueue.h`, in plain words.
+
+Picture a circular track with 64 numbered parking spaces and two markers. The **write marker** says where the producer parks the next car. The **read marker** says where the consumer will take the next car from. The producer only ever moves the write marker. The consumer only ever moves the read marker. Neither touches the other's marker, so nobody ever has to ask permission.
+
+Push writes the data into the space first, and only then advances the write marker:
+
+<CodeRef path="AudIO/AudIO/Core/SPSCQueue.h" line={16} expect="ringBuffer[oldWritePos] = dataIn;">
+
+```cpp
+ringBuffer[oldWritePos] = dataIn;
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/Core/SPSCQueue.h" line={17} expect="writePos.store(newWritePos);">
+
+```cpp
+writePos.store(newWritePos);
+```
+
+</CodeRef>
+
+That order is the whole trick. The consumer can only see the car after the marker moves, and by then the car is fully parked. The markers are `std::atomic`, and the default atomic operations in C++ come with strong ordering guarantees that make this reliable (general C++ knowledge). The two markers:
+
+<CodeRef path="AudIO/AudIO/Core/SPSCQueue.h" line={38} expect="readPos { 0 }, writePos { 0 }">
+
+```cpp
+std::atomic<size_t> readPos { 0 }, writePos { 0 };
+```
+
+</CodeRef>
+
+The "full" check explains the 63 from Finding 4. The queue calls itself full when advancing the write marker would land on the read marker. That wastes one space on purpose, so that "full" and "empty" look different: a 64-space ring holds 63.
+
+The rule that keeps it correct is exactly one producer and exactly one consumer. Two producers racing on the write marker would break it. So a custom OS would keep these queues and add three habits: check the return value of `push`, give each producer its own queue, and size the queue for the worst burst.
+
+### 2. Never allocate: preallocate and recycle
+
+Every banned allocation has the same cure: make the memory before the deadline starts. Allocate at startup, hand out pieces from a free list, and take them back instead of freeing them. The buffer pool does this. The missing piece is the objects themselves. Instead of letting the audio thread delete a removed object, the fix is a **trash queue**: the audio thread unlinks the object from the graph and drops its pointer into a queue, and the message thread, which has time, does the actual `delete`. The audio thread never frees anything.
+
+### 3. Never reorganize live: swap, don't edit
+
+The graph sort is the hard one, because the data structure is complex. The standard answer is to build the new run order off to the side, on the message thread, and then publish it with a single atomic pointer swap. The audio thread reads the pointer once per block and works on a consistent snapshot. The old snapshot must not be freed until the audio thread has moved on, and the trash queue from the last step handles that. The cost is double memory for the order vector. The benefit is that structural edits stop being a per-block risk.
+
+### 4. Give the audio thread priority from the OS
+
+Code discipline is half the answer. The other half is how the operating system schedules the thread. Two facts from the pinned tree, both from reading config files:
+
+The app's service file gives it a low CPU weight against other services:
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/rootfs_overlay/etc/systemd/system/ktkick.service" line={13} expect="CPUWeight=20">
+
+```text
+CPUWeight=20
+```
+
+</CodeRef>
+
+The kernel config in the Buildroot build selects full preemption, not the real-time patch set:
+
+<CodeRef path="Linux/buildroot/configs/KTKick_defconfig" line={17} expect="BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE">
+
+```text
+BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig"
+```
+
+</CodeRef>
+
+<CodeRef path="Linux/buildroot/board/freescale/imx8mm_var_som/linux-configs/Linux-defconfig" line={5} expect="CONFIG_PREEMPT=y">
+
+```text
+CONFIG_PREEMPT=y
+```
+
+</CodeRef>
+
+`CONFIG_PREEMPT` lets the kernel interrupt most of its own work to run something urgent. It improves response, but it is not the full real-time kernel, which bounds the worst-case delay much more tightly (general Linux knowledge). A custom OS aiming at the tightest latency could try three standard moves: run the audio thread under a real-time scheduling policy such as `SCHED_FIFO`, raise or remove the weight cap on the service, and build the kernel with the PREEMPT_RT patches. I have not tried any of them on this hardware. They are the usual list, not a tested recipe.
+
+## Customization pointers
+
+- **Add a new object.** Subclass `AudIO::Object`, implement `process` without allocating, and end the header with `REGISTER_OBJECT`. `SineWave.h` and `SineWave.cpp` are the template. Put anything that needs memory in `prepareToPlay`.
+- **Move deletion off the audio thread.** Start in `DesignImpl::handleRemove` and `handleClearDesign`. Replace the `erase` and `clear` calls with pushes onto a trash queue drained by the message thread.
+- **Stop patches from vanishing.** In `PatchQueue::push`, test the return value of `_queue.push` and fall back to something that cannot lose the request.
+- **Choose a block size.** The ceiling is `BLOCK_SIZE` in `DawEngine.cpp`. The requested value lives in `AudIO_constants`, which you do not have. You would define your own.
+- **Fix the scheduling.** The service file and the kernel config named above are the two places to start.
+- **Check your build first.** The public AudIO folder is missing the JUCE wrapper and the constants module. I did not try to build it. Expect to supply the missing pieces.
+
+## Try it yourself
+
+With the upstream clone at the pinned commit, do a grep tour. Write one sentence for each answer.
+
+```bash
+# 1. Where is the audio callback hooked up?
+grep -rn "setAudioCallback\|addAudioCallback\|setCallback" AudIO/AudIO Kick/modules --include=*.cpp --include=*.h
+# 2. Which classes are AudIO objects?
+grep -rn "public AudIO::Object\|public Object" AudIO/AudIO Kick/modules --include=*.h
+# 3. Which objects are registered with the factory?
+grep -rn "REGISTER_OBJECT" AudIO/AudIO --include=*.h | grep -v airwindows
+# 4. Where does the graph free or allocate memory?
+grep -n "erase\|clear()\|resize\|push_back" AudIO/AudIO/Core/DesignImpl.cpp
+# 5. Where is a file read inside an audio callback?
+grep -rn "reader->read" Kick/modules/engine/audio_engine
+```
+
+Now answer the harder question by reading. Start at `DesignImpl::process` and follow every call it makes, one level at a time. Write down each line reachable from it that frees or allocates memory. Check your list against the findings above: you should find the clears, the erases in `handleRemove`, and the resize in `topologicalSort`. If you find one I missed, that is a real result, and I want to hear about it.
+
+Last, do the math. Pick a block size from the table, compute the time to deadline, and then compute how many of those blocks pass during a one-second file read of 40 ms. The answer tells you why Finding 5 matters.
+
+## Check yourself
+
+<Quiz
+  items={[
+    {
+      q: 'A block holds 480 frames at 48 kHz. How long does the audio thread have to produce it?',
+      options: [
+        '480 microseconds',
+        '1 millisecond',
+        '10 milliseconds',
+        '48 milliseconds',
+      ],
+      answer: 2,
+      why: '480 divided by 48,000 is 0.01 seconds, or 10 ms. The 480 here is the ceiling in DawEngine.cpp; the real block size lives in a module the public repo does not include.',
+    },
+    {
+      q: 'Why is "my code is fast on average" not enough on the audio thread?',
+      options: [
+        'The average is hard to measure',
+        'One block that runs past the deadline makes an audible glitch, so the worst case is what counts',
+        'The audio thread cannot run fast code',
+        'Averages are only valid at 44.1 kHz',
+      ],
+      answer: 1,
+      why: 'The hardware will not wait. A single late block means a click, however many blocks were early.',
+    },
+    {
+      q: 'Which of these is allowed on the audio thread?',
+      options: [
+        'Locking a mutex that the message thread also uses',
+        'Calling new to make a buffer',
+        'Writing a log line to a file',
+        'Updating a std::atomic voice state',
+      ],
+      answer: 3,
+      why: 'Atomics never make a thread wait. The other three can block or take unbounded time.',
+    },
+    {
+      q: 'DesignImpl::process calls handleRemove through processRemoveQueue. What problem does that create?',
+      options: [
+        'The object is deleted on the audio thread, which frees memory inside the deadline',
+        'The object is never deleted',
+        'The queue is too small to hold the request',
+        'The object is deleted twice',
+      ],
+      answer: 0,
+      why: 'handleRemove erases the object from its containers, which runs its destructor and frees memory. That is a banned operation inside the callback.',
+    },
+    {
+      q: 'Why can the SPSC queue in SPSCQueue.h work without a lock?',
+      options: [
+        'It runs only at startup',
+        'It copies the whole queue on every push',
+        'Exactly one thread moves the write marker and exactly one moves the read marker, so they never write the same variable',
+        'It uses a spinlock that only waits a few nanoseconds',
+      ],
+      answer: 2,
+      why: 'Each marker has one writer. The producer writes the data first and moves the marker second, so the consumer never sees a half-written item. Two producers would break this.',
+    },
+  ]}
+/>
+
+## Words to know
+
+| Term | Meaning |
+|---|---|
+| Real-time audio | Audio code that must finish every block before a hard deadline, every time |
+| Sample | One number describing the sound pressure at one instant on one channel |
+| Frame | One sample for every channel at the same instant |
+| Block (buffer, period) | A group of consecutive frames the driver asks for in one call |
+| Deadline | The time by which the next block must be ready, equal to frames divided by sample rate |
+| Audio callback | The function the audio driver calls once per block, on the audio thread |
+| Priority inversion | A high-priority thread stuck waiting for a lock held by a low-priority thread |
+| Atomic | A variable updated in one indivisible step, so other threads never see it half-written |
+| AudIO::Object | The base class for every box in the sound graph: inputs, outputs, parameters and a process function |
+| ObjectFactory | A global name-to-constructor table used to create objects by name |
+| Design | A container that owns objects, patches them together and runs them in order |
+| Patch | A connection from one object's output to another's input |
+| Topological sort | Ordering a graph so every object comes after the ones feeding it |
+| Memory pool | A big block of memory reserved at startup and handed out in fixed pieces |
+| SPSC queue | A single-producer, single-consumer ring buffer that needs no lock |
+| Data race | Two threads touching the same memory with no ordering, where at least one writes. Behavior is undefined |
+| Preemption | The kernel interrupting running work to run something more urgent |
+
+Next: Module 7 (coming soon).

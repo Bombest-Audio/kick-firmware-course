@@ -1,0 +1,1635 @@
+---
+title: '7. Sound engine II: programs, voices and effects'
+description: What a program, a voice and a sample each are in the KICK code, how one pad press becomes playback, how the sampler reads audio, how voices sum into a bus, and how the Airwindows effects plug in.
+---
+
+import { Image } from 'astro:assets';
+import { Aside } from '@astrojs/starlight/components';
+import CodeRef from '../../../components/CodeRef.astro';
+import Quiz from '../../../components/Quiz.astro';
+import hero from '../../../assets/heroes/m07-sound-engine-2.png';
+
+<Image src={hero} alt="A row of small slabs in different shapes, each feeding one glowing violet bus." />
+
+**Module 7 of 12 &#183; about 40 minutes &#183; needs Module 6**
+
+You hit a pad. A drum sound comes out. Between those two events sit three ideas that the code keeps apart: a program, a voice and a sample. Mix them up and the source reads like soup. Keep them apart and it reads like a plan.
+
+This lesson picks up where Module 5 stopped, at the call that starts a note. I follow that note into the engine, down to the loop that reads audio from memory. Then I show how finished voices add up into a bus, and how an Airwindows effect gets onto an insert slot.
+
+By the end you will be able to name the class behind each program type, trace a pad press to the line that starts a voice, say how pitch works in the sampler, and list the steps to add one more effect.
+
+<Aside type="note" title="Analogy">
+A jukebox room. A program is one jukebox model, with its own rules for what each button plays. A voice is one turntable arm that is spinning right now. A sample is the record. Pressing a button picks a record and looks for a free arm. If every arm that button may use is busy, nothing plays. The KICK engine works almost exactly like this, and the last rule is a real quirk, not a metaphor.
+</Aside>
+
+<Aside type="caution" title="What I could check">
+I read the source at one pinned commit. I did not build the firmware or run it on a unit. Every code badge below says "Not verified on hardware" for that reason. Where I say what a line does, that is my reading.
+
+The public tree is partial in places that matter here. Several constants the engine uses, such as `POLYPHONY::MAX`, `MIDI::SCALER` and `AUDIO_SAMPLE_RATE`, are used everywhere but defined nowhere I could find. So I cannot cite a real voice count, block size or gain scale. The module that wraps JUCE audio, `AudIO_juce`, is also missing. Module 6 covers that gap. The `AudIO` folder itself looks whole: core, DAW layer, DSP, headers, objects and the Airwindows effects.
+</Aside>
+
+## Three words that look alike
+
+The code uses "program", "voice" and "sample" in several ways. Here is the split I use for the whole lesson.
+
+- **Program.** A kind of instrument slot. It decides what a note means. There is a model class on the message-thread side and an audio class on the audio side.
+- **Voice.** One playing sound inside an audio-side program. It holds a position in a sample, a gain, and a few envelopes. It is borrowed from a pool and given back when it finishes.
+- **Sample.** The word has three meanings. I name each one below, so you can tell them apart when you grep.
+
+### The two halves of a program
+
+The model side is `MTIProgram`. It is backed by a JUCE `ValueTree`, so it is easy to save, load and undo.
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_iprogram.h" line={62} expect="class MTIProgram">
+
+```cpp
+class MTIProgram
+```
+
+</CodeRef>
+
+The audio side is `ISynthObject`. It is an `AudIO::Object`, the box type from Module 6, so the graph can run it each block.
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.h" line={29} expect="class ISynthObject : public AudIO::Object">
+
+```cpp
+class ISynthObject : public AudIO::Object
+```
+
+</CodeRef>
+
+The model class builds its audio twin, hands it to the engine, and wires it to an output bus. This is the drum program's constructor path. Three lines tell the story:
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_drum_program.cpp" line={31} expect="std::make_unique">
+
+```cpp
+auto pProg = std::make_unique<DrumProgram>( Engine, getName().toStdString(), this );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_drum_program.cpp" line={35} expect="Engine.createObject(">
+
+```cpp
+Engine.createObject( std::move( pProg ) );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_drum_program.cpp" line={39} expect="connectOutputTo( outBusId );">
+
+```cpp
+drum->connectOutputTo( outBusId );
+```
+
+</CodeRef>
+
+Build, register, connect. The model object keeps a pointer to its audio twin, and the graph owns the twin.
+
+### Voices
+
+A voice base class sits between the program and the sample reader.
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.h" line={26} expect="class ISynthVoice">
+
+```cpp
+class ISynthVoice
+```
+
+</CodeRef>
+
+Two voice types derive from it. The drum voice has an LFO, a filter and envelopes. The audio voice is the plain one.
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/drum_voice.h" line={28} expect="class DrumVoice : public ISynthVoice">
+
+```cpp
+class DrumVoice : public ISynthVoice
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/audio_voice.h" line={28} expect="class AVoice : public ISynthVoice">
+
+```cpp
+class AVoice : public ISynthVoice
+```
+
+</CodeRef>
+
+A voice is always in one state. The state is an atomic, because the model side and the audio side both look at it.
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.h" line={81} expect="std::atomic">
+
+```cpp
+std::atomic<State> state{ State::FREE };
+```
+
+</CodeRef>
+
+The states are `FREE`, `SETUP`, `RUNNING` and `STOPPING`. A voice starts `FREE`. Voices are not made during play. The drum program builds its whole pool when it is constructed:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={38} expect="std::make_unique">
+
+```cpp
+voices.emplace_back( std::make_unique<DrumVoice>( master ) );
+```
+
+</CodeRef>
+
+That is the right call for audio code: allocate up front, borrow later (general real-time audio knowledge, from Module 6). Notice the argument. Every voice gets the program's `master`, a shared bundle of atomic pitch and gain values. That detail matters again in the mixing section.
+
+### Three kinds of sample
+
+First, the **per-note record**, `MTISample`. One per pad or key. It holds the note number, the mute group, the polyphony, semitone and fine tune, gain, pan, and a set of layers.
+
+<CodeRef path="Kick/modules/engine/interface/source/mt_audio_interface_types.h" line={353} expect="struct MTISample">
+
+```cpp
+struct MTISample
+```
+
+</CodeRef>
+
+A note can have up to four layers.
+
+<CodeRef path="Kick/modules/engine/interface/source/mt_audio_interface_types.h" line={52} expect="MAX_LAYERS{ 4 }">
+
+```cpp
+static constexpr int MAX_LAYERS{ 4 };
+```
+
+</CodeRef>
+
+Second, the **slice**, `ASoundSlice`. It is a window over a file: where to start, where to end, whether to loop or reverse, plus tuning and gain.
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audio_sound.h" line={70} expect="class ASoundSlice">
+
+```cpp
+class ASoundSlice
+```
+
+</CodeRef>
+
+Third, the **sound**, `ASound`. It is the decoded file data in memory. Slices point into sounds.
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audio_sound.h" line={27} expect="class ASound : public juce::ReferenceCountedObject">
+
+```cpp
+class ASound : public juce::ReferenceCountedObject
+```
+
+</CodeRef>
+
+The loader always decodes to two channels:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audio_sound.cpp" line={80} expect="constexpr int defaultNumChannels = 2;">
+
+```cpp
+constexpr int defaultNumChannels = 2;
+```
+
+</CodeRef>
+
+So a mono file is stored as stereo in memory. The rest of the sampler never has to ask how many channels a file had.
+
+## The program types
+
+The type is a plain enum.
+
+<CodeRef path="Kick/modules/engine/interface/source/mt_audio_interface_types.h" line={97} expect="enum class MTProgramType">
+
+```cpp
+enum class MTProgramType
+```
+
+</CodeRef>
+
+Its values are Drum 0, Keygroup 1, Midi 2, Audio 3, Clip 4, Plugin 5, Cv 6 and Unknown 7. A factory function turns a saved program into a model object. It has one branch per type:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_program.cpp" line={103} expect="MTProgramType::Drum ) prog">
+
+```cpp
+if( type == MTProgramType::Drum ) prog = new MTDrumProgram( engine, VT, undoManager );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_program.cpp" line={104} expect="MTProgramType::Keygroup ) prog">
+
+```cpp
+if( type == MTProgramType::Keygroup ) prog = new MTKeygroupProgram( engine, VT, undoManager );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_program.cpp" line={105} expect="MTProgramType::Clip ) prog">
+
+```cpp
+if( type == MTProgramType::Clip ) prog = new MTClipProgram( engine, VT, undoManager );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_program.cpp" line={106} expect="MTProgramType::Midi ) prog">
+
+```cpp
+if( type == MTProgramType::Midi ) prog = new MTMidiProgram( engine, VT, undoManager );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_program.cpp" line={107} expect="MTProgramType::Cv ) prog">
+
+```cpp
+if( type == MTProgramType::Cv ) prog = new MTCVProgram( engine, VT, undoManager );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_manager_program.cpp" line={108} expect="MTProgramType::Audio ) prog">
+
+```cpp
+if( type == MTProgramType::Audio ) prog = new MTAudioProgram( engine, VT, undoManager );
+```
+
+</CodeRef>
+
+`Plugin` and `Unknown` have no branch in that function. By my reading, they exist as names only at this commit. Here is what each real type does, with the line that shows it.
+
+| Type | What it is | How it makes sound |
+|------|------------|--------------------|
+| Drum | One sample slot per pad, up to four layers each | Audio class `DrumProgram`, voices of type `DrumVoice` |
+| Keygroup | A keyboard layout of samples | Audio class `KeygroupProgram`, but the note handler is switched off |
+| Clip | A pad that plays a whole clip | Audio class `ClipProgram`, one slice per voice |
+| Audio | Audio clips placed by start position | Audio class `AudioProgram`, one voice at a time |
+| Midi | Sends notes out of a MIDI port | No synth object, no samples |
+| Cv | Drives the CV/Gate jacks | No synth object, no samples |
+
+Drum is the main one. Its layers pick which sample answers a hit, and the choice rule is an enum:
+
+<CodeRef path="Kick/modules/engine/interface/source/mt_audio_interface_types.h" line={132} expect="enum class LayerPlayType">
+
+```cpp
+enum class LayerPlayType
+```
+
+</CodeRef>
+
+The three rules are `CYCLE`, `VELOCITY` and `RANDOM`. I show how each one runs in the trace below.
+
+The Clip type always behaves as a one-shot:
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_clip_program.h" line={51} expect="return SamplePlayType::ONE_SHOT;">
+
+```cpp
+SamplePlayType getNoteSamplePlay( int Note ) override { return SamplePlayType::ONE_SHOT; };
+```
+
+</CodeRef>
+
+It has a toggle mode that stops a playing clip on a second press:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/clipProgram.cpp" line={84} expect="ClipPlayType::CLIP_TOGGLE ==">
+
+```cpp
+if( ClipPlayType::CLIP_TOGGLE == clipNote->padPlay.get() )
+```
+
+</CodeRef>
+
+And it asks for a voice with a polyphony of one, so one clip per pad:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/clipProgram.cpp" line={94} expect="getFreeVoice( Note, 1 )">
+
+```cpp
+if( auto pVoice = getFreeVoice( Note, 1 ) )
+```
+
+</CodeRef>
+
+The Audio type constructs its base with a polyphony of one:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/audioProgram.cpp" line={31} expect=": ISynthObject( D, 1 )">
+
+```cpp
+: ISynthObject( D, 1 )
+```
+
+</CodeRef>
+
+It fetches its slice from an asset manager by name, with an empty name:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/audioProgram.cpp" line={65} expect={`assetMgr.getAssetSlice( "" )`}>
+
+```cpp
+auto  slice    = assetMgr.getAssetSlice( "" ); // Source
+```
+
+</CodeRef>
+
+The MIDI type does not make sound. It scales the velocity by the program level and sends the note to a port:
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_midi_program.cpp" line={118} expect="ae.sendMidiMessage( midiPort.get(), it );">
+
+```cpp
+ae.sendMidiMessage( midiPort.get(), it );
+```
+
+</CodeRef>
+
+The CV type holds a reference to a CV interface, and that is the whole link to the jacks:
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_cv_program.h" line={64} expect="CV&">
+
+```cpp
+CV&              cvinterface;
+```
+
+</CodeRef>
+
+<Aside type="caution" title="My reading, not run on hardware">
+The Keygroup note handler looks switched off at this commit. It checks that the note is valid and not muted, then returns before it does anything else:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/KeygroupProgram.cpp" line={63} expect="isNoteEffectivelyMuted( Note ) ) return;">
+
+```cpp
+if( pKeys->isNoteEffectivelyMuted( Note ) ) return;
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/KeygroupProgram.cpp" line={67} expect="return;">
+
+```cpp
+return;
+```
+
+</CodeRef>
+
+The real body starts on the next line, inside a block comment:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/KeygroupProgram.cpp" line={68} expect="/*">
+
+```cpp
+/*
+```
+
+</CodeRef>
+
+So no voice starts from a Keygroup note on at this commit. I did not run it. If a Keygroup program plays on a real unit, a different path must do it, and I did not find one.
+</Aside>
+
+## One pad press, from the engine to a playing voice
+
+Module 5 traced a pad press from the serial port up to the call that hands it to a program. I start from the screen that turns it into a note. Each box below has a citation after the diagram.
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>AppMainmode</b><br />Turns a pad into a MIDI note on.</div>
+    <div class="kd-step"><b>MTAudioInterface</b><br />addLiveMidiMsg finds the track.</div>
+    <div class="kd-step"><b>MTTrack</b><br />Passes the note list to its program.</div>
+    <div class="kd-step"><b>MTIProgram</b><br />noteProcess checks mute, then calls noteOn.</div>
+    <div class="kd-step"><b>DrumProgram</b><br />Picks a layer and a free voice.</div>
+    <div class="kd-step"><b>ISynthVoice</b><span class="layer layer-audio">voice</span><br />State becomes RUNNING, the reader starts.</div>
+  </div>
+  <figcaption>The note path from screen to voice. I did not trace which thread runs each of the first five boxes. For notes from the sequencer, Module 8 shows the hop runs on the clock tick thread, not the audio thread.</figcaption>
+</figure>
+
+**Hop 1, the screen.** The main-mode screen checks that the hardware message is a pad press, adds the bank offset, and builds a standard JUCE MIDI note on.
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppMainMode.cpp" line={393} expect="isPadButtonMessage( f_HwMsg )">
+
+```cpp
+if( contracts::DclContractsHelper::isPadButtonMessage( f_HwMsg ) )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppMainMode.cpp" line={401} expect="padNo += bankOffset;">
+
+```cpp
+padNo += bankOffset;
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppMainMode.cpp" line={409} expect="juce::MidiMessage::noteOn( 1, it, (juce::uint8)velocity )">
+
+```cpp
+Msg = juce::MidiMessage::noteOn( 1, it, (juce::uint8)velocity );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_AppMainMode.cpp" line={413} expect="ae.addLiveMidiMsg( ae.getSelected(), Msg );">
+
+```cpp
+ae.addLiveMidiMsg( ae.getSelected(), Msg );
+```
+
+</CodeRef>
+
+The note is a plain MIDI message, channel 1. From here the engine does not care that a pad made it.
+
+**Hop 2, the interface and the track.** The engine interface hands the message to the selected track. The track hands the note list to its program.
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_interface.cpp" line={1750} expect="processIncomingMidiMessage( Msg );">
+
+```cpp
+t->processIncomingMidiMessage( Msg );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_track.cpp" line={404} expect="noteProcess( list );">
+
+```cpp
+pProgram->noteProcess( list );
+```
+
+</CodeRef>
+
+**Hop 3, the program base class.** `noteProcess` skips everything if the program is muted. For a note on, it calls the virtual `noteOn` for one-shot and note-on play types.
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_iprogram.cpp" line={263} expect="if( isProgramEffectivelyMuted() )">
+
+```cpp
+if( isProgramEffectivelyMuted() )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_iprogram.cpp" line={282} expect="noteOn( noteNo, midiLevel );">
+
+```cpp
+noteOn( noteNo, midiLevel );
+```
+
+</CodeRef>
+
+**Hop 4, model to audio class.** The drum model class forwards the call to its audio twin in one line.
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_drum_program.h" line={48} expect="noteOn( Note, Velocity )">
+
+```cpp
+void noteOn( int Note, int Velocity ) override { drum->noteOn( Note, Velocity ); };
+```
+
+</CodeRef>
+
+**Hop 5, the drum program.** This is where the real decisions are. `DrumProgram::noteOn` first stops any note in the same mute group. That is how a closed hat cuts an open hat.
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={58} expect="void DrumProgram::noteOn( int Note, int Velocity )">
+
+```cpp
+void DrumProgram::noteOn( int Note, int Velocity )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={70} expect="noteOff( it );">
+
+```cpp
+noteOff( it );
+```
+
+</CodeRef>
+
+Next it picks a layer with a `switch` on the layer rule:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={95} expect="layerPlay.get() )">
+
+```cpp
+switch( pNote->layerPlay.get() )
+```
+
+</CodeRef>
+
+`RANDOM` draws a random index among the layers that have a source:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={99} expect="AudIO::utils::random">
+
+```cpp
+layerToPlay = AudIO::utils::random<int>( 0, ( (int)validSourceIndex.size() - 1 ) );
+```
+
+</CodeRef>
+
+`VELOCITY` picks the layer whose velocity window contains the hit:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={113} expect="velStart.get() <= Velocity">
+
+```cpp
+if( pNote->layers[it]->velStart.get() <= Velocity && Velocity < pNote->layers[it]->velEnd.get() )
+```
+
+</CodeRef>
+
+`CYCLE` keeps a counter per note. Each hit adds one:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={105} expect="juce::jlimit(">
+
+```cpp
+noteLayerIdx[Note] = juce::jlimit( 0, (int)( validSourceIndex.size() - 1 ), ++noteLayerIdx[Note] );
+```
+
+</CodeRef>
+
+<Aside type="caution" title="My reading, not run on hardware">
+`jlimit` clamps a value into a range. It does not wrap. So by this line, a counter that reaches the last layer stays on the last layer. A round robin would use a modulo instead. I did not run it, so I cannot say whether the pad really sticks on the last layer or whether another line resets the counter. Test it with a four-layer pad before you rely on cycling.
+</Aside>
+
+With a layer chosen, the program takes its slice, borrows a voice, loads the slice into the voice, starts the voice, and registers the voice for playback:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={125} expect="getFreeVoice( Note, notePoly )">
+
+```cpp
+if( auto voice = dynamic_cast<DrumVoice*>( getFreeVoice( Note, notePoly ) ) )
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={127} expect="setSlice( soundSlice );">
+
+```cpp
+voice->setSlice( soundSlice );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={128} expect="noteOn( Note, Velocity );">
+
+```cpp
+voice->noteOn( Note, Velocity );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={129} expect="addVoiceForPlayback( voice );">
+
+```cpp
+addVoiceForPlayback( voice );
+```
+
+</CodeRef>
+
+**Hop 6, the voice pool.** `getFreeVoice` is the gate. Read it slowly.
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={94} expect="if( numPlaying < Polyphony )">
+
+```cpp
+if( numPlaying < Polyphony )
+```
+
+</CodeRef>
+
+If fewer than `Polyphony` voices are already playing this note, it scans the pool for a free one. Otherwise it goes to the `else` branch. That branch is a comment and nothing else:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={101} expect="{ // Steal voice.">
+
+```cpp
+{ // Steal voice.
+```
+
+</CodeRef>
+
+Then the function falls to its last line:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={104} expect="return nullptr;">
+
+```cpp
+return nullptr;
+```
+
+</CodeRef>
+
+So when a pad is at its polyphony limit, the next hit gets no voice. The `if` in `DrumProgram::noteOn` sees a null and skips the whole block. The press makes no sound. This is the jukebox rule from the analogy. A real "steal the oldest voice" step was planned, by the look of the comment, and left empty. This is my reading of the source. I did not press a pad forty times on a unit.
+
+The upper bound on polyphony comes from a clamp, with a constant I cannot read:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={34} expect="POLYPHONY::MAX">
+
+```cpp
+numPolyphony = AudIO::utils::limit<int>( 0, POLYPHONY::MAX, Polyphony );
+```
+
+</CodeRef>
+
+`POLYPHONY::MAX` has no definition in the public tree. It is one of the missing constants I flagged at the top.
+
+**Hop 7, starting the voice.** `DrumVoice::noteOn` sets up its LFO, filter and envelopes, then calls the base version:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/drum_voice.cpp" line={67} expect="ISynthVoice::noteOn( Number, Velocity );">
+
+```cpp
+ISynthVoice::noteOn( Number, Velocity );
+```
+
+</CodeRef>
+
+The base version moves the state forward, sets the voice gain from velocity, and starts the reader. First the gain. Velocity 127 means gain 1.0. The comment on the line says the scale is linear:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.cpp" line={50} expect="Velocity / 127.0">
+
+```cpp
+gain.setTargetValue( ( (double)Velocity / 127.0 ) ); // Linear scale...
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.cpp" line={52} expect="state.store( State::RUNNING );">
+
+```cpp
+state.store( State::RUNNING );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.cpp" line={53} expect="ASliceRenderer::start();">
+
+```cpp
+ASliceRenderer::start();
+```
+
+</CodeRef>
+
+The voice is now `RUNNING`. Nothing has made sound yet. The sound happens later, when the audio thread asks each voice for a block. That is the next section.
+
+## How a voice makes samples
+
+Every block, the graph calls each object, and each object calls each voice. Module 6 shows the graph side:
+
+<CodeRef path="AudIO/AudIO/Core/DesignImpl.cpp" line={63} expect="process();">
+
+```cpp
+obj->process();
+```
+
+</CodeRef>
+
+The program object runs its voices in a loop. After the loop come its own processing, its inserts, and its master gain.
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={195} expect="process( bufferToFill );">
+
+```cpp
+it->process( bufferToFill );
+```
+
+</CodeRef>
+
+A drum voice does the real per-sample work. For each output frame it computes a pitch factor from its pitch envelope, the program pitch and its LFO:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/drum_voice.cpp" line={183} expect="auto pMod   = pitchAdsr * masterPitchRatio">
+
+```cpp
+auto pMod   = pitchAdsr * masterPitchRatio * ( 1.0 - ( lfoToPitch * lfoOut ) ); // Pitch modulation factor.
+```
+
+</CodeRef>
+
+Then it asks the sample reader for the next frame at that pitch:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/drum_voice.cpp" line={188} expect="auto& sample = getNext( pMod );">
+
+```cpp
+auto& sample = getNext( pMod );
+```
+
+</CodeRef>
+
+`getNext` belongs to the slice renderer. That is the sampler. Now I explain what it does and why.
+
+### Sample rate, in one paragraph
+
+A recording is a list of numbers. Each number is the air pressure at one instant. The sample rate is how many numbers per second (general knowledge). A file at 44100 Hz holds 44100 numbers for each second of sound. The output runs at a fixed rate. If a file's rate differs from the output rate, you must read the file at a different speed to keep the pitch right.
+
+### Pitch by playback rate
+
+To change pitch, change the read speed. Read twice as fast and every wave repeats twice as often, so the sound goes up one octave and lasts half as long (general knowledge). Read at half speed and it goes down an octave and lasts twice as long. There is no separate pitch control. Speed and pitch are the same knob here.
+
+The code does exactly this. The read position is a `double`, so it can sit between two stored frames.
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audio_sound_renderer.h" line={94} expect="double curPos{ 0.0 };">
+
+```cpp
+double curPos{ 0.0 };
+```
+
+</CodeRef>
+
+For every output frame, the position moves forward by a step. The step is the slice's rate factor times the pitch ratio:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audio_sound_renderer.cpp" line={188} expect="getEffectiveResamplerRate() * PitchRatio )">
+
+```cpp
+const auto newPos    = curPos + ( slice->getEffectiveResamplerRate() * PitchRatio ); \
+```
+
+</CodeRef>
+
+The slice computes its base factor as the file's rate divided by the output rate:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audio_sound.cpp" line={296} expect="getSampleRate() / resamplingRate">
+
+```cpp
+resamplingFactor = source ? ( ( source->getSampleRate() / resamplingRate ) ) : 1.0;
+```
+
+</CodeRef>
+
+The output rate it divides by has a default taken from a named constant:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audio_sound.h" line={157} expect="resamplingRate{ AUDIO_SAMPLE_RATE }">
+
+```cpp
+double              resamplingRate{ AUDIO_SAMPLE_RATE };
+```
+
+</CodeRef>
+
+`AUDIO_SAMPLE_RATE` has no definition in the public tree, so I cannot cite its value. Elsewhere the voice class holds a field that says 48000:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.h" line={79} expect="double sampleRate{ 48000 };">
+
+```cpp
+double sampleRate{ 48000 };
+```
+
+</CodeRef>
+
+I will not claim the output rate from that field alone.
+
+Tuning multiplies the factor. The slice's tune step does:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audio_sound.cpp" line={280} expect="effRate = resamplingFactor.load() * tf;">
+
+```cpp
+effRate = resamplingFactor.load() * tf;
+```
+
+</CodeRef>
+
+A semitone value turns into a ratio with the standard formula, two to the power of cents over 1200:
+
+<CodeRef path="AudIO/AudIO/Includes/Utils.h" line={524} expect="return pow( 2, ( cents / 1200.0 ) );">
+
+```cpp
+return pow( 2, ( cents / 1200.0 ) );
+```
+
+</CodeRef>
+
+So +12 semitones is 1200 cents, a ratio of 2, a step of two frames per output frame. The program-level pitch uses the same helper whenever the semitone or fine knob changes:
+
+<CodeRef path="Kick/modules/engine/audio_program/source/mt_audio_iprogram_atomics.h" line={32} expect="calculatePitchFactor( semi(), fine() )">
+
+```cpp
+pitchRatio = AudIO::utils::calculatePitchFactor( semi(), fine() );
+```
+
+</CodeRef>
+
+### Interpolation: reading between frames
+
+The position is rarely a whole number. At 10.25 the reader sits a quarter of the way from frame 10 to frame 11. It needs a value there, but only whole frames are stored. Interpolation is a rule for guessing the in-between value (general knowledge).
+
+The code splits the position into a whole part and a fraction called `alpha`:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audio_sound_renderer.cpp" line={195} expect="alpha          = curPos - iPos;">
+
+```cpp
+alpha          = curPos - iPos;                                       \
+```
+
+</CodeRef>
+
+The rule it uses is linear. A straight line between the two nearest frames:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/interpolators.h" line={42} expect="return ( ( x0 * invAlpha ) + ( x1 * alpha ) );">
+
+```cpp
+return ( ( x0 * invAlpha ) + ( x1 * alpha ) );
+```
+
+</CodeRef>
+
+With `invAlpha` defined one line above as one minus alpha:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/interpolators.h" line={40} expect="const float invAlpha = 1.f - alpha;">
+
+```cpp
+const float invAlpha = 1.f - alpha;
+```
+
+</CodeRef>
+
+At alpha 0.25 you get 75 percent of frame 10 plus 25 percent of frame 11. The renderer applies it to both channels with the slice gain:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audio_sound_renderer.h" line={76} expect="linearInterpolator( alpha, inL[m0], inL[m1] )">
+
+```cpp
+*pL = slice->gL * linearInterpolator( alpha, inL[m0], inL[m1] );
+```
+
+</CodeRef>
+
+Linear interpolation is cheap and clean for small pitch moves. When you pitch up by a lot, it lets in aliasing: harsh, folded-back high frequencies (general knowledge). Higher-order rules, such as cubic, cost more and sound cleaner.
+
+The header names a cubic rule as the preferred one:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/interpolators.h" line={34} expect="#define PREFERRED_INTERPOLATOR ( INTERPOLATOR_CUBIC )">
+
+```cpp
+#define PREFERRED_INTERPOLATOR ( INTERPOLATOR_CUBIC )
+```
+
+</CodeRef>
+
+<Aside type="caution" title="My reading, not run on hardware">
+The cubic and hermite functions exist in that header, but I found no call to them. The renderer line above calls the linear one directly. By my reading, `PREFERRED_INTERPOLATOR` is a wish, not a switch, and playback is linear at this commit. A grep for `PREFERRED_INTERPOLATOR` shows whether I missed a use.
+</Aside>
+
+### Where playback ends
+
+A non-looping slice ends when the position passes the end. It sets a `finished` flag and parks the position at the end:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audio_sound_renderer.cpp" line={214} expect="finished.store( outOfBounds ? true : finished.load() );">
+
+```cpp
+finished.store( outOfBounds ? true : finished.load() );
+```
+
+</CodeRef>
+
+A looping slice wraps back to the loop start and keeps the overshoot:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audio_sound_renderer.cpp" line={227} expect="curPos = outOfBounds ? ( loopStart + ( newPos - loopEnd ) ) : newPos;">
+
+```cpp
+curPos = outOfBounds ? ( loopStart + ( newPos - loopEnd ) ) : newPos;
+```
+
+</CodeRef>
+
+When the voice sees `finished`, it frees itself, and the pool gets the voice back:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.cpp" line={100} expect="makeFree();">
+
+```cpp
+makeFree();
+```
+
+</CodeRef>
+
+One more fact explains why all of this happens at playback time. The loader has an upsample ratio, and it is one:
+
+<CodeRef path="Kick/modules/engine/audio_file_manager/source/audiofile_manager.cpp" line={82} expect="#define ASOUND_UPSAMPLE_RATIO ( 1 )">
+
+```cpp
+#define ASOUND_UPSAMPLE_RATIO ( 1 )
+```
+
+</CodeRef>
+
+So loading does not resample. Files sit in memory at their own rate, and the playback step does all the rate matching. This is my reading of how the constant is passed on.
+
+## From voices to the bus
+
+Each voice adds its block into the program's buffer. The add is plain addition, with no limiter:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthVoice.cpp" line={96} expect="Buffer.addFrom( 0, 0, tempBuffer, 0, 0, numSamples );">
+
+```cpp
+Buffer.addFrom( 0, 0, tempBuffer, 0, 0, numSamples );
+```
+
+</CodeRef>
+
+The drum voice adds with a gain argument at the same point:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/drum_voice.cpp" line={198} expect="Buffer.addFrom( 0, 0, tempBuffer, 0, 0, numSamples, masterGainL );">
+
+```cpp
+Buffer.addFrom( 0, 0, tempBuffer, 0, 0, numSamples, masterGainL );
+```
+
+</CodeRef>
+
+After all voices have run, the program object does its own pass, then its inserts, then its master gain and pan:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={198} expect="doProcess( bufferToFill );">
+
+```cpp
+doProcess( bufferToFill );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={201} expect="AudIO::DawInserts::process( buffer );">
+
+```cpp
+AudIO::DawInserts::process( buffer );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={204} expect="postProcess( bufferToFill );">
+
+```cpp
+postProcess( bufferToFill );
+```
+
+</CodeRef>
+
+Then the program's output reaches a bus. `connectOutputTo` is the routing call, and it passes a gain to the bus input:
+
+<CodeRef path="AudIO/AudIO/Daw/DawRouting.cpp" line={116} expect="design_.sendToBus( ToId, id_, Gain )">
+
+```cpp
+auto retVal = design_.sendToBus( ToId, id_, Gain );
+```
+
+</CodeRef>
+
+The bus stores a gain for each input it receives:
+
+<CodeRef path="AudIO/AudIO/Core/Bus.cpp" line={35} expect="Bus::addInput( objectMeta& Src, float Gain )">
+
+```cpp
+std::pair<bool, uint32_t> Bus::addInput( objectMeta& Src, float Gain )
+```
+
+</CodeRef>
+
+On each block, the bus mixes all its inputs with those gains, then runs its own effect chain:
+
+<CodeRef path="AudIO/AudIO/Core/Bus.cpp" line={216} expect="_mixOutBuffer.stereoMixer( Buffer, _gains );">
+
+```cpp
+_mixOutBuffer.stereoMixer( Buffer, _gains );
+```
+
+</CodeRef>
+
+Inside the mixer, each input is added to the output with its gain:
+
+<CodeRef path="AudIO/AudIO/Includes/AudIOBuffer.h" line={213} expect="addWithGain">
+
+```cpp
+utils::addWithGain<float>( leftOut, leftIn, size, gain );
+```
+
+</CodeRef>
+
+And the basic add helper is what you would hope for:
+
+<CodeRef path="AudIO/AudIO/Includes/Utils.h" line={331} expect="return ( Dst + Src );">
+
+```cpp
+return ( Dst + Src );
+```
+
+</CodeRef>
+
+<figure class="kd">
+  <div class="kd-steps">
+    <div class="kd-step"><b>Voices</b><span class="layer layer-audio">audio thread</span><br />Each adds its block into the program buffer.</div>
+    <div class="kd-step"><b>doProcess, inserts</b><br />Program pass, then up to 4 insert effects.</div>
+    <div class="kd-step"><b>Master gain and pan</b><br />postProcess scales left and right.</div>
+    <div class="kd-step"><b>Bus mixer</b><br />Adds every input times its own gain.</div>
+    <div class="kd-step"><b>Bus chain</b><br />The bus effect chain, then on to the output.</div>
+  </div>
+  <figcaption>The signal path from many voices to one bus. Every join is an add.</figcaption>
+</figure>
+
+The fader on a channel strip is also a gain on this path. It converts a 0 to 127 control value with one multiply:
+
+<CodeRef path="Kick/modules/common/source/kick_common_utils.cpp" line={50} expect="return ( MIDI::SCALER * MidiValue );">
+
+```cpp
+return ( MIDI::SCALER * MidiValue );
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/kick_ui_channel_mixer/source/kick_output_track_mix.cpp" line={122} expect="gain = CommonUtils::midiToGain(Value)">
+
+```cpp
+levelSlider.onValueChanged = [&]( double Value ) { if( pBus) pBus->gain = CommonUtils::midiToGain(Value); };
+```
+
+</CodeRef>
+
+The fader law is linear, a straight multiply. The scale constant `MIDI::SCALER` is one of the missing definitions, so I cannot say where full travel lands.
+
+### Gain staging and headroom
+
+Gain staging means keeping the level sensible at every stage, so nothing is too quiet to hide in noise and nothing is too loud to clip. This part is general knowledge, not something the code proves.
+
+- Adding two uncorrelated signals of equal level raises the level about 3 dB. Adding two identical signals raises it 6 dB. Eight loud hits on a bus can pass full scale.
+- Inside the engine the math is floating point, so a sum above 1.0 does not clip. It only clips when it is converted to fixed-point integers for the converter (general knowledge about audio drivers).
+- So the place to look for a clip is the last stage before the hardware, and any limiter you add belongs there.
+
+The code gives one hint. A buffer class has a function named `compressOutputs`, which the name says would squash peaks. Its only call is commented out:
+
+<CodeRef path="AudIO/AudIO/Includes/AudIOBuffer.h" line={251} expect="//compressOutputs();">
+
+```cpp
+//compressOutputs();
+```
+
+</CodeRef>
+
+I found no limiter or soft clipper anywhere on the voice-to-bus path. Dense patterns with hot samples can sum past full scale. Whether that is audible depends on the later stages, which I cannot see in the public tree.
+
+<Aside type="caution" title="My reading, not run on hardware">
+The drum program's gain and pan look like they are applied twice. Every `DrumVoice` is built with the program's shared `master`:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/DrumProgram.cpp" line={38} expect="std::make_unique">
+
+```cpp
+voices.emplace_back( std::make_unique<DrumVoice>( master ) );
+```
+
+</CodeRef>
+
+Each voice multiplies by `masterGainL` when it adds into the buffer, at the `drum_voice.cpp` line shown above. Then the program object multiplies the whole buffer by the same master gain again:
+
+<CodeRef path="Kick/modules/engine/audio_program/synth/iSynthObject.cpp" line={221} expect="buffer.applyGain( 0, 0, ns, master.gainL.load() );">
+
+```cpp
+buffer.applyGain( 0, 0, ns, master.gainL.load() );
+```
+
+</CodeRef>
+
+If both run, a program at gain 0.5 would come out at 0.25. I did not run it or measure it. If you hear drum programs react more strongly to their level knob than audio programs, this is the first place I would look. The audio voice path does not apply the master gain at voice level.
+</Aside>
+
+## Airwindows effects: the wrapper pattern
+
+The KICK ships hundreds of effects by Chris Johnson of Airwindows. They are not rewritten for the KICK. A thin shim lets the original code run as an `AudIO::Object`.
+
+### The shim
+
+The shim class is `AudioEffectX`. In the original plugin world, that name belongs to the VST SDK. Here it is a stand-in that derives from the box type from Module 6:
+
+<CodeRef path="AudIO/AudIO/airwindows/audioeffectx.h" line={18} expect="class AudioEffectX : public AudIO::Object">
+
+```cpp
+class AudioEffectX : public AudIO::Object
+```
+
+</CodeRef>
+
+It declares two inputs, two outputs and a parameter count:
+
+<CodeRef path="AudIO/AudIO/airwindows/audioeffectx.h" line={22} expect=": AudIO::Object( 2, 2, NumParams )">
+
+```cpp
+: AudIO::Object( 2, 2, NumParams )
+```
+
+</CodeRef>
+
+The VST types that the old code expects are faked with plain integers:
+
+<CodeRef path="AudIO/AudIO/airwindows/airwindows_base.h" line={5} expect="typedef int VstInt32;">
+
+```cpp
+typedef int VstInt32;
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/airwindows/airwindows_base.h" line={7} expect="typedef int audioMasterCallback;">
+
+```cpp
+typedef int audioMasterCallback;
+```
+
+</CodeRef>
+
+The engine calls `process`. The shim answers by calling the effect's own `processReplacing`, with the same buffer as input and output. That means the effect works in place:
+
+<CodeRef path="AudIO/AudIO/airwindows/audioeffectx.h" line={166} expect="void process( AudIO::Buffer">
+
+```cpp
+void process( AudIO::Buffer<float>& Buffer ) override
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/airwindows/audioeffectx.h" line={168} expect="processReplacing( (float**)Buffer.getOutputs(), Buffer.getOutputs()">
+
+```cpp
+processReplacing( (float**)Buffer.getOutputs(), Buffer.getOutputs(), (VstInt32)blockSize() );
+```
+
+</CodeRef>
+
+### One effect, three files
+
+Each effect is a folder with a header, a source file for parameters, and a source file for the audio loop. I use Acceleration as the example. The class derives from the shim:
+
+<CodeRef path="AudIO/AudIO/airwindows/src/Acceleration/Acceleration.h" line={30} expect="public AudioEffectX">
+
+```cpp
+public AudioEffectX
+```
+
+</CodeRef>
+
+The constructor passes the program and parameter counts up:
+
+<CodeRef path="AudIO/AudIO/airwindows/src/Acceleration/Acceleration.cpp" line={13} expect="AudioEffectX( audioMaster, kNumPrograms, kNumParameters )">
+
+```cpp
+AudioEffectX( audioMaster, kNumPrograms, kNumParameters )
+```
+
+</CodeRef>
+
+A parameter setter is a switch on an enum value:
+
+<CodeRef path="AudIO/AudIO/airwindows/src/Acceleration/Acceleration.cpp" line={85} expect="case kParamA: A = value; break;">
+
+```cpp
+case kParamA: A = value; break;
+```
+
+</CodeRef>
+
+And a name getter gives the label that the screen shows:
+
+<CodeRef path="AudIO/AudIO/airwindows/src/Acceleration/Acceleration.cpp" line={105} expect={`vst_strncpy( text, "Limit", kVstMaxParamStrLen )`}>
+
+```cpp
+case kParamA: vst_strncpy( text, "Limit", kVstMaxParamStrLen ); break;
+```
+
+</CodeRef>
+
+The audio loop lives in a third file:
+
+<CodeRef path="AudIO/AudIO/airwindows/src/Acceleration/AccelerationProc.cpp" line={10} expect="void Acceleration::processReplacing(float **inputs, float **outputs, VstInt32 sampleFrames)">
+
+```cpp
+void Acceleration::processReplacing(float **inputs, float **outputs, VstInt32 sampleFrames)
+```
+
+</CodeRef>
+
+It scales its timing by the actual sample rate, so it behaves the same at any rate:
+
+<CodeRef path="AudIO/AudIO/airwindows/src/Acceleration/AccelerationProc.cpp" line={19} expect="overallscale *= getSampleRate();">
+
+```cpp
+overallscale *= getSampleRate();
+```
+
+</CodeRef>
+
+The line before that sets `overallscale` from a base figure, and I did not read what that base is. General knowledge says Airwindows effects were tuned at 44.1 kHz and scale from there. I did not verify that in this tree.
+
+### Registration
+
+An effect is registered by a macro. It builds an object factory entry with the effect name, the manufacturer string `AirWindows`, the kind `Plugin`, and a category:
+
+<CodeRef path="AudIO/AudIO/airwindows/audioeffectx.h" line={16} expect="#define REG_AIRWIN( Name, Cat )">
+
+```cpp
+#define REG_AIRWIN( Name, Cat ) REGISTER_OBJECT_WITH_ARGS( #Name, Name, 1, "AirWindows", "Plugin", #Cat );
+```
+
+</CodeRef>
+
+That expands into a static object. Its constructor runs before `main`, so no function has to be called. The factory macro:
+
+<CodeRef path="AudIO/AudIO/Includes/ObjectFactory.h" line={14} expect="static AudIO::ObjectFactoryRegistration">
+
+```cpp
+#define REGISTER_OBJECT_WITH_ARGS( type, Object, Arg, Man, Cat, ObjType ) static AudIO::ObjectFactoryRegistration<Object> _##Object( type, Arg, Man, Cat, ObjType )
+```
+
+</CodeRef>
+
+The registration object stores a lambda that builds the effect with its one argument:
+
+<CodeRef path="AudIO/AudIO/Includes/ObjectFactory.h" line={107} expect="return std::make_unique">
+
+```cpp
+[arg]() { return std::make_unique<T>( arg ); } );
+```
+
+</CodeRef>
+
+It also stores a description record for the UI:
+
+<CodeRef path="AudIO/AudIO/Includes/ObjectFactory.h" line={116} expect="ObjectFactory::Get().AddInfo( type, { manufacturer, objectType, category, type } );">
+
+```cpp
+ObjectFactory::Get().AddInfo( type, { manufacturer, objectType, category, type } );
+```
+
+</CodeRef>
+
+The record has four fields. Look at the order in the struct:
+
+<CodeRef path="AudIO/AudIO/Includes/AudioDataTypes.h" line={50} expect="std::string Manufacturer;">
+
+```cpp
+std::string Manufacturer;
+```
+
+</CodeRef>
+
+The struct holds `Manufacturer`, `Type`, `Category` and `Name`, in that order. The macro passes `"Plugin"` as the object type and the Airwindows category, such as `Brightness`, as the category argument. How those land in the record depends on the registration constructor's argument order, which I read only in part. Treat the exact field mapping as my reading.
+
+The registration sits in a namespace block, so the many effects do not collide on names. This is the whole block for Acceleration:
+
+<CodeRef path="AudIO/AudIO/airwindows/airwindows.cpp" line={10} expect="namespace Acceleration">
+
+```cpp
+namespace Acceleration
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/airwindows/airwindows.cpp" line={12} expect={`#include "src/Acceleration/Acceleration.h"`}>
+
+```cpp
+#include "src/Acceleration/Acceleration.h"
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/airwindows/airwindows.cpp" line={13} expect="REG_AIRWIN( Acceleration, Brightness )">
+
+```cpp
+REG_AIRWIN( Acceleration, Brightness )
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/airwindows/airwindows.cpp" line={14} expect={`#include "src/Acceleration/Acceleration.cpp"`}>
+
+```cpp
+#include "src/Acceleration/Acceleration.cpp"
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/airwindows/airwindows.cpp" line={15} expect={`#include "src/Acceleration/AccelerationProc.cpp"`}>
+
+```cpp
+#include "src/Acceleration/AccelerationProc.cpp"
+```
+
+</CodeRef>
+
+Note the trick. The effect's `.cpp` files are included, not compiled on their own. All the effects become one big translation unit, and each namespace keeps its names apart. Two top-level files hold the blocks, and one build file includes them both:
+
+<CodeRef path="AudIO/AudIO/AudIO_airwindows.cpp" line={28} expect={`#include "airwindows/airwindows.cpp"`}>
+
+```cpp
+#include "airwindows/airwindows.cpp"
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/AudIO_airwindows.cpp" line={29} expect={`#include "airwindows/airwindows2.cpp"`}>
+
+```cpp
+#include "airwindows/airwindows2.cpp"
+```
+
+</CodeRef>
+
+The engine does call an init function at startup:
+
+<CodeRef path="AudIO/AudIO/Daw/DawEngine.cpp" line={38} expect="initAirWindowsEffects();">
+
+```cpp
+initAirWindowsEffects();
+```
+
+</CodeRef>
+
+But look at what the function does. It calls its twin, and the twin is empty:
+
+<CodeRef path="AudIO/AudIO/airwindows/airwindows.cpp" line={1383} expect="initAirWindowsEffects2();">
+
+```cpp
+initAirWindowsEffects2();
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/airwindows/airwindows2.cpp" line={1277} expect="void initAirWindowsEffects2()">
+
+```cpp
+void initAirWindowsEffects2()
+```
+
+</CodeRef>
+
+So that call registers nothing. By my reading its job is to make sure the linker keeps the file that holds the static registrations. The registrations themselves run through the static objects. I did not check the linker behavior.
+
+### From the registry to a screen
+
+When the user opens the Inserts screen, the UI reads the categories out of the registry:
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_interface.cpp" line={1938} expect="return AudIO::DawInserts::getEffectsMap();">
+
+```cpp
+return AudIO::DawInserts::getEffectsMap();
+```
+
+</CodeRef>
+
+<CodeRef path="Kick/modules/engine/audio_engine/engine/mt_audio_interface.cpp" line={1948} expect="categories.emplace( it.second.Type );">
+
+```cpp
+categories.emplace( it.second.Type );
+```
+
+</CodeRef>
+
+The category list reads the `Type` field of each record. That is why the Airwindows category names matter. When the user picks an effect, the screen asks to add it to a slot:
+
+<CodeRef path="Kick/modules/kick_ui/dialogs/kick_Inserts.cpp" line={106} expect="addInsert( s, i );">
+
+```cpp
+pEffects->addInsert( s, i );
+```
+
+</CodeRef>
+
+A program or bus has a fixed number of insert slots:
+
+<CodeRef path="AudIO/AudIO/Daw/DawInserts.h" line={15} expect="MAX_INSERTS{ 4 }">
+
+```cpp
+const static int MAX_INSERTS{ 4 };
+```
+
+</CodeRef>
+
+The slot creates the effect by name through the factory:
+
+<CodeRef path="AudIO/AudIO/Daw/DawInserts.cpp" line={23} expect="pObj = std::move( CREATE_OBJECT( Effect ) );">
+
+```cpp
+pObj = std::move( CREATE_OBJECT( Effect ) );
+```
+
+</CodeRef>
+
+And on every block, the insert chain runs each effect in turn:
+
+<CodeRef path="AudIO/AudIO/Daw/DawInserts.cpp" line={212} expect="process( Buffer );">
+
+```cpp
+it.pObj->process( Buffer );
+```
+
+</CodeRef>
+
+<figure class="kd">
+  <div class="kd-row">
+    <div class="kd-node layer-audio"><b>Effect class</b>Derives from AudioEffectX</div>
+    <div class="kd-node layer-message"><b>Object factory</b>Name to builder, plus a record</div>
+    <div class="kd-node layer-audio"><b>Insert slot</b>Builds by name, runs in the chain</div>
+  </div>
+  <figcaption>An effect reaches a slot through the factory. The slot never names the effect class.</figcaption>
+</figure>
+
+### The license
+
+The Airwindows folder carries a license file. It is the MIT license:
+
+<CodeRef path="AudIO/AudIO/airwindows/LICENSE" line={1} expect="MIT License">
+
+```text
+MIT License
+```
+
+</CodeRef>
+
+With the author's name in the copyright line:
+
+<CodeRef path="AudIO/AudIO/airwindows/LICENSE" line={3} expect="Copyright (c) 2018 Chris Johnson">
+
+```text
+Copyright (c) 2018 Chris Johnson
+```
+
+</CodeRef>
+
+A readme in the same folder says the same thing, and so does each effect's header:
+
+<CodeRef path="AudIO/AudIO/airwindows/what.txt" line={1} expect="These are MIT licensed open source">
+
+```text
+These are MIT licensed open source: see my github at https://github.com/airwindows/airwindows for the source.
+```
+
+</CodeRef>
+
+<CodeRef path="AudIO/AudIO/airwindows/src/Acceleration/Acceleration.h" line={4} expect="Airwindows uses the MIT license">
+
+```text
+*  Copyright (c) 2011 __MyCompanyName__, Airwindows uses the MIT license
+```
+
+</CodeRef>
+
+Three places agree, so the Airwindows code in this tree is MIT licensed. That is the license of the effect code only. The AudIO module around it declares a different license:
+
+<CodeRef path="AudIO/AudIO/AudIO_airwindows.h" line={15} expect="AGPLv3">
+
+```text
+license:            AGPLv3
+```
+
+</CodeRef>
+
+So the shim and the module are AGPLv3, and the effect code inside is MIT. I am describing the notices in the files. I am not giving legal advice, and I did not check every one of the effect folders.
+
+### Add one more effect
+
+These steps come from the Acceleration pattern above. I did not build any of them.
+
+1. Make a folder `src/MyFx/` under the Airwindows folder. Add `MyFx.h`, `MyFx.cpp` and `MyFxProc.cpp`.
+2. In the header, declare `class MyFx : public AudioEffectX`. Add a parameter enum, state variables, and a `processReplacing` declaration.
+3. In `MyFx.cpp`, write the constructor that passes the program and parameter counts to `AudioEffectX`. Add the parameter set, get and name functions.
+4. In `MyFxProc.cpp`, write `processReplacing`. Read from the input arrays and write to the output arrays. They are the same memory.
+5. In `airwindows.cpp` or `airwindows2.cpp`, add a namespace block like the Acceleration one: include the header, call `REG_AIRWIN( MyFx, SomeCategory )`, then include the two source files.
+6. Nothing else needs to change. Both top-level files are already included by `AudIO_airwindows.cpp`, and the registration is a static object.
+7. The category you pass becomes the label in the Inserts category list.
+
+If you want the effect to build outside the shim, you need the VST types faked in the base header. If your effect uses a VST call the shim does not define, the compile fails there first.
+
+## Trade-offs and rough edges
+
+- **Two sampler stacks live in the tree.** The live one is `audio_program/synth` plus `audio_file_manager`. A second set of sampler classes sits under `engine/objects/sampler`. Its polyphony constant is 16:
+
+<CodeRef path="Kick/modules/engine/objects/sampler/ISampler.h" line={25} expect="#define MAX_POLYPHONY_PER_OBJECT ( 16 )">
+
+```cpp
+#define MAX_POLYPHONY_PER_OBJECT ( 16 )
+```
+
+</CodeRef>
+
+  The engine build file lists the modules it builds, and `objects` is not among them. The list runs from line 2 to line 10, and `audio_program` is on line 7:
+
+<CodeRef path="Kick/modules/engine/CMakeLists.txt" line={7} expect="audio_program">
+
+```text
+audio_program
+```
+
+</CodeRef>
+
+  Nothing outside the folder includes it. By my reading, the second stack is not built. I ran no build. Do not quote 16 as the real polyphony.
+- **A full pad drops the hit.** The steal branch is empty. Short samples hide it. Long tails make it audible.
+- **No limiter on the way to the bus.** Headroom is yours to manage.
+- **Linear interpolation.** Cheap and fine for small moves. It aliases on big pitch-ups.
+- **Keygroup is a stub** at this commit.
+- **Missing glue.** The public tree has no `AudIO_juce`, and the audio interface header depends on it:
+
+<CodeRef path="Kick/modules/audio_interface/audio_interface.h" line={17} expect="dependencies:       AudIO_juce">
+
+```text
+dependencies:       AudIO_juce
+```
+
+</CodeRef>
+
+  So the link between the KICK and the AudIO audio device cannot be read here.
+
+## Customization pointers
+
+These are directions drawn from the code above. I did not build or run any of them.
+
+**Add a program type.** Add a value to `MTProgramType`. Write a model class that derives from `MTIProgram`, and an audio class that derives from `ISynthObject`. Copy the three-line pattern from the drum constructor: build, `createObject`, `connectOutputTo`. Add a branch to `createProgram`. The `toString` and `fromString` helpers next to the enum, and any screens that switch on type, also need the new value.
+
+**Add an effect.** The seven steps above.
+
+**Replace the sampler.** The reader is the `ASliceRenderer` class, and the interpolation is one call in the renderer header. Swapping that call for a better rule is the smallest change. A bigger change is a new voice class that derives from `ISynthVoice` and reads its own audio. Leave the dead `objects/sampler` code alone until you know whether anything uses it.
+
+## Try it yourself
+
+With the upstream clone at the pinned commit, do a grep tour of the Drum program, from class to sound. Write one sentence for each answer.
+
+```bash
+# 1. Which model class builds a drum program, and which audio class does it make?
+grep -n "DrumProgram" Kick/modules/engine/audio_program/source/mt_audio_drum_program.cpp
+# 2. Where does the note leave the model class?
+grep -n "noteOn" Kick/modules/engine/audio_program/source/mt_audio_drum_program.h
+# 3. How does DrumProgram pick a layer? List the three cases.
+grep -n "LayerPlayType::" Kick/modules/engine/audio_program/synth/DrumProgram.cpp
+# 4. Where is a voice borrowed, loaded and started?
+grep -n "getFreeVoice\|setSlice\|noteOn\|addVoiceForPlayback" Kick/modules/engine/audio_program/synth/DrumProgram.cpp
+# 5. What happens when no voice is free?
+grep -n -A12 "ISynthObject::getFreeVoice" Kick/modules/engine/audio_program/synth/iSynthObject.cpp
+# 6. Where does the position step happen?
+grep -n "getEffectiveResamplerRate" Kick/modules/engine/audio_file_manager/source/audio_sound_renderer.cpp
+# 7. Where does the voice add into the buffer?
+grep -n "addFrom" Kick/modules/engine/audio_program/synth/drum_voice.cpp Kick/modules/engine/audio_program/synth/iSynthVoice.cpp
+```
+
+Then answer these:
+
+1. Draw the chain of five class names from `MTDrumProgram` to the line that adds into the buffer.
+2. Which grep shows the empty steal branch? Write what the player hears when it is reached.
+3. Is `PREFERRED_INTERPOLATOR` used anywhere? Run `grep -rn PREFERRED_INTERPOLATOR Kick/modules` and say what you found.
+
+## Check yourself
+
+<Quiz
+  items={[
+    {
+      q: 'In the KICK code, what is a voice?',
+      options: [
+        'The decoded audio file in memory',
+        'One playing sound that is borrowed from a pool and returned when it finishes',
+        'The saved settings for one pad',
+        'The MIDI note that a pad press creates',
+      ],
+      answer: 1,
+      why: 'A voice holds a read position, a gain and envelopes. The program borrows it with getFreeVoice, and it frees itself when the slice finishes.',
+    },
+    {
+      q: 'A pad is already at its polyphony limit and you hit it again. What does the stock code do?',
+      options: [
+        'Stops the oldest voice and reuses it',
+        'Plays the hit on a second bus',
+        'Returns no voice, so the hit makes no sound',
+        'Raises the polyphony limit by one',
+      ],
+      answer: 2,
+      why: 'The steal branch in getFreeVoice is only a comment. The function falls through to return nullptr, and DrumProgram::noteOn skips the playback block.',
+    },
+    {
+      q: 'The renderer position step for a +12 semitone tune on a slice at the output rate is about what?',
+      options: [
+        'Half a frame per output frame',
+        'One frame per output frame',
+        'Two frames per output frame',
+        'Twelve frames per output frame',
+      ],
+      answer: 2,
+      why: 'Twelve semitones is 1200 cents. The helper returns two to the power of 1200 over 1200, which is 2. The position moves two frames each step, so the sound is an octave up and half as long.',
+    },
+    {
+      q: 'How do many voices combine on the way to a bus?',
+      options: [
+        'They are averaged, so the level never rises',
+        'A limiter picks the loudest one',
+        'They are added, and the bus adds each program with its own gain',
+        'Only the newest voice is heard',
+      ],
+      answer: 2,
+      why: 'Voices addFrom into one buffer. The bus mixer then adds each input times a stored gain. The compressOutputs call that could squash peaks is commented out.',
+    },
+    {
+      q: 'You write a new Airwindows-style effect folder. What registers it with the engine?',
+      options: [
+        'A call to initAirWindowsEffects at startup',
+        'A REG_AIRWIN line in a namespace block, which makes a static factory registration',
+        'Editing the Inserts screen to list the new name',
+        'Adding the class to MTProgramType',
+      ],
+      answer: 1,
+      why: 'REG_AIRWIN expands to a static ObjectFactoryRegistration. It runs before main. The init function only calls an empty twin. The Inserts screen reads the factory, so it needs no edit.',
+    },
+  ]}
+/>
+
+## Words to know
+
+| Term | Meaning |
+|------|---------|
+| Program | An instrument slot that decides what a note means. Has a model class and an audio class |
+| MTIProgram | The model-side base class, backed by a ValueTree |
+| ISynthObject | The audio-side base class for programs. It is an AudIO object |
+| Voice | One playing sound, borrowed from a pool |
+| Polyphony | How many voices may play at once, here counted per note |
+| Slice | A window over a file with loop, tune and gain settings |
+| Sound | The decoded file data in memory |
+| Layer | One of up to four samples stacked on a pad |
+| Mute group | Notes that cut each other off, like open and closed hats |
+| Playback rate | How many stored frames the reader moves per output frame. Rate sets pitch |
+| Interpolation | A rule that guesses a value between two stored frames |
+| Aliasing | False high tones that appear when a signal is read too coarsely |
+| Bus | A mixing point that adds its inputs, each with a gain |
+| Insert | An effect slot on a program or bus |
+| Gain staging | Keeping the level sensible at every stage so nothing clips or hides in noise |
+| Headroom | The space between the current peak and full scale |
+| Shim | A thin layer that lets old code run in a new setting |
+
+Next: Module 8 (coming soon).
