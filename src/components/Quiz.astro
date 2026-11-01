@@ -12,21 +12,132 @@ const { items } = Astro.props;
 const letters = ['A', 'B', 'C', 'D'];
 ---
 
-<div class="quiz">
+<div class="quiz" data-total={items.length}>
 	{
 		items.map((item, n) => (
-			<div class="quiz-item">
+			<div class="quiz-item" data-answer={item.answer}>
 				<p class="quiz-q"><span class="quiz-n">{n + 1}</span> {item.q}</p>
 				<ul class="quiz-opts">
 					{item.options.map((o, i) => (
-						<li><span class="quiz-l">{letters[i]}</span> {o}</li>
+						<li>
+							<button type="button" class="quiz-opt" data-i={i} disabled>
+								<span class="quiz-l">{letters[i]}</span> {o}
+							</button>
+						</li>
 					))}
 				</ul>
-				<details>
+				<p class="quiz-fb" role="status" hidden>
+					<strong class="quiz-verdict" />
+					<span class="quiz-why">
+						<strong>{letters[item.answer]}.</strong> {item.why}
+					</span>
+				</p>
+				<details class="quiz-static">
 					<summary>Show answer</summary>
 					<p><strong>{letters[item.answer]}.</strong> {item.why}</p>
 				</details>
 			</div>
 		))
 	}
+	<div class="quiz-foot" hidden>
+		<p class="quiz-score" role="status"></p>
+		<button type="button" class="quiz-reset">Try again</button>
+	</div>
 </div>
+
+<script>
+	// Upgrades each .quiz in place. Without JavaScript the buttons stay disabled
+	// and the static "Show answer" blocks remain the way to check an answer.
+	function storageKey(index: number): string {
+		return `kfc-quiz:${location.pathname}:${index}`;
+	}
+	function load(key: string): Array<number | null> | null {
+		try {
+			const raw = localStorage.getItem(key);
+			const parsed = raw ? JSON.parse(raw) : null;
+			return Array.isArray(parsed) ? parsed : null;
+		} catch {
+			return null;
+		}
+	}
+	function save(key: string, value: Array<number | null>): void {
+		try {
+			localStorage.setItem(key, JSON.stringify(value));
+		} catch {
+			// Storage can be blocked or full. The quiz works without it.
+		}
+	}
+	function clear(key: string): void {
+		try {
+			localStorage.removeItem(key);
+		} catch {
+			// Same as save: ignore.
+		}
+	}
+
+	document.querySelectorAll<HTMLElement>('.quiz').forEach((quiz, quizIndex) => {
+		const key = storageKey(quizIndex);
+		const items = Array.from(quiz.querySelectorAll<HTMLElement>('.quiz-item'));
+		const foot = quiz.querySelector<HTMLElement>('.quiz-foot')!;
+		const score = quiz.querySelector<HTMLElement>('.quiz-score')!;
+		const reset = quiz.querySelector<HTMLButtonElement>('.quiz-reset')!;
+		const choices: Array<number | null> = items.map(() => null);
+
+		quiz.dataset.live = 'true';
+
+		function paint(item: HTMLElement, chosen: number | null): void {
+			const answer = Number(item.dataset.answer);
+			const fb = item.querySelector<HTMLElement>('.quiz-fb')!;
+			const verdict = item.querySelector<HTMLElement>('.quiz-verdict')!;
+			item.querySelectorAll<HTMLButtonElement>('.quiz-opt').forEach((btn) => {
+				const i = Number(btn.dataset.i);
+				btn.disabled = chosen !== null;
+				btn.classList.toggle('is-correct', chosen !== null && i === answer);
+				btn.classList.toggle('is-wrong', chosen !== null && i === chosen && i !== answer);
+				btn.setAttribute('aria-pressed', String(chosen === i));
+			});
+			fb.hidden = chosen === null;
+			fb.classList.toggle('is-correct', chosen === answer);
+			if (chosen !== null) {
+				verdict.textContent = chosen === answer ? 'Correct. ' : 'Not quite. Answer: ';
+			}
+		}
+
+		function update(): void {
+			const answered = choices.filter((c) => c !== null).length;
+			const correct = items.filter((it, i) => choices[i] === Number(it.dataset.answer)).length;
+			foot.hidden = answered === 0;
+			score.textContent =
+				answered === items.length
+					? `Score: ${correct} of ${items.length}.`
+					: `${answered} of ${items.length} answered, ${correct} correct so far.`;
+		}
+
+		const saved = load(key);
+		items.forEach((item, i) => {
+			if (saved && items.length === saved.length) choices[i] = saved[i];
+			paint(item, choices[i]);
+			item.querySelectorAll<HTMLButtonElement>('.quiz-opt').forEach((btn) => {
+				btn.addEventListener('click', () => {
+					if (choices[i] !== null) return;
+					choices[i] = Number(btn.dataset.i);
+					paint(item, choices[i]);
+					save(key, choices);
+					update();
+				});
+			});
+		});
+
+		reset.addEventListener('click', () => {
+			items.forEach((item, i) => {
+				choices[i] = null;
+				paint(item, null);
+			});
+			clear(key);
+			update();
+			items[0]?.querySelector<HTMLButtonElement>('.quiz-opt')?.focus();
+		});
+
+		update();
+	});
+</script>
